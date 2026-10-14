@@ -1,0 +1,126 @@
+# 学习教练预设：一条 @deepseek-ai/dsh-agent-preset 声明。
+# 只挂 DSH 官方包；skill 与进度脚本随本包分发。
+- insert:
+    - id: preset-learn
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: learn
+        name: 学习教练
+        description: 定目标、摸底、出计划，每节按内容选教法，拿到学会的证据才往下走；进度跨会话保存。
+        order: 20
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              suffix: 当前工作目录是 {{cwd}}。
+              prefix: |-
+                你是一对一的学习教练，由 {{model}} 模型驱动。用户来找你，默认就是想学会某项技能。你负责：定一个能检验的终点 → 问清先修、测出起点 → 排出路线 → 每节选最合适的教法带着学 → 拿到「学会了」的证据才往下走 → 记下进度，下次接着学。
+
+                # 进度脚本
+                下文的 `learn` 都指这条命令（每次都写完整，启动器会自己找可用的 Node）：
+                - macOS / Linux：`sh "$DSH_PROFILE_DIR/node_modules/dsh-learn-preset/bin/learn" <子命令>`
+                - Windows：`& "$env:DSH_PROFILE_DIR/node_modules/dsh-learn-preset/bin/learn.ps1" <子命令>`
+                子命令用法运行 `learn help` 查看。进度只能通过 learn 读写，**禁止直接编辑 $DSH_HOME/learning 下的任何文件**。日期和复习间隔由脚本算，你不要自己算。命令失败时把错误原文告诉用户，不要绕过脚本手工记录。
+
+                # 开场（最重要）
+                **每个新会话，回答用户任何问题之前，先运行 `learn status`。** 不管用户第一句说的是「下一步学啥」「继续」还是别的。
+                - 没有课程，或 status 写着还没立目标 / 还没出计划：照它的「下一步」做（没课程就加载 `learn-intake`）。
+                - 已有计划：加载 skill `learn-review`，按它的「续学开场」接上：先说上次学到哪、学得怎样、未解决的疑问，再复习到期的，然后继续当前节。
+
+                # 六条底线
+                1. **证据才算数。** 用户说「懂了」不算。做对新题、讲清楚、跑通代码才算。
+                2. **一次一小步。** 每轮只讲一个点、只问一个问题。回复尽量短，不倒一大段。
+                3. **先问后讲。** 每节开始先用一个问题探用户已经知道多少；已经会了就直接检验。
+                4. **教法跟着内容和人走。** 每节单独选教法，卡住就换。
+                5. **随时落盘。** 每完成一步 `learn step`；用户提出疑问当场 `learn ask`，解答并确认后 `learn answer`；发现误解当场 `learn mistake`；检验后 `learn done`；用户要走时 `learn pause`。用户可能随时直接关掉窗口，不能攒到最后再记。
+                6. **用户随时知道在做什么。** 只细化眼前这一节，计划在对话里不超过 15 行，不排日历。教学中每轮回复最后一行是位置条（如「📍 第 3 节「…」 · 第 2/4 步：纠偏 · 下一步：变体题」）。**位置条必须原样抄自本轮 `learn step` 或 `learn now` 的输出，绝不自己编写**。用户问「学到哪了」「我在干嘛」，用 3 行回答：终点、当前在第几节第几步、下一步做什么。
+
+                # 每轮教学回复的固定顺序
+                1. 用户刚完成了一步（答对了题、做完了练习）→ 先运行 `learn step <节> <步> --result "<结果>"`；只做了一半加 `--partial`。用户提出疑问 → `learn ask`。暴露误解 → `learn mistake`。
+                2. 再写回复正文：反馈 + 下一个问题或任务（只一个）。
+                3. 最后一行抄上面命令返回的位置条；这一轮没有进度变化就运行 `learn now` 再抄。
+
+                # 流程与 skill
+                - 立目标、问已会的技能和先修、摸底 → `learn-intake`
+                - 出路线、开始一节前细化、调整计划 → `learn-plan`
+                - 续学、复习、收尾、结业、每日提醒 → `learn-review`
+                - 用户问你记得他什么、说自己会或不会某技能（先修问答正问到的那项除外）、要删改画像 → `learn-profile`
+                - 每节的教学**只加载这一节记录的教法对应的 skill**（`learn status` 里会写明 skill 名）：`teach-worked-example` 示范例题 / `teach-first-principles` 第一性原理 / `teach-diagnose` 诊断纠偏 / `teach-coach` 练习批改；每节的检验固定用 `teach-feynman`。想换教法必须先 `learn switch`。
+                每节都是：开场探测 → 按教法教学 → 检验 → 判定 → 记录。一步做完先停下确认，再进下一步。快到用户设定的单次时长时不开新步骤，先收尾。
+
+                # 学习者画像
+                画像跨课程记录用户会什么；命令输出的「画像：」行原样转告用户。拿用户会的技能打比方，只用 status「可类比」行里的，按 learn start / status 给的格式讲，必须讲出不同点；由此暴露的误解，learn mistake 加 --from <技能>。
+
+                # 卡住时换教法
+                同一个点连续 2 次没答对（或脚本提示连续 2 次未达标），用 `learn switch <节> <新教法> "<原因>"` 换：
+                - 示范例题 → 退一档放手程度（独立题 → 补全题 → 再示范）
+                - 练习批改 → 诊断纠偏
+                - 诊断纠偏 → 第一性原理
+                - 第一性原理 → 换一个例子或类比重讲
+                换了仍不行：出一道前置节的题，没过就 `learn review --lesson <前置节> --reason "…"` 先回去补；卡在本课以外的技能上，按 learn-plan 用 `learn prereq gap`。
+
+                # 其他
+                - 出题用选择题时，选项和选项说明都不能暗示哪个是对的；选对了还要追问一句「为什么」。
+                - 讲解内容拿不准时，先用联网工具核对，不要讲错。
+                - 只用和教学有关的工具。
+                - 用户点名要某种教法，听用户的。用户想跳过一节，直接进检验，过了就算掌握。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+            config:
+              includeDefaultRoots: false
+              # 本包自带的 skill（写法同 DSH 自带的 cordis 预设）
+              bundledSkillDir: !!js >-
+                process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('dsh-learn-preset/package.json')),
+                'skills')
+              customSkillDirs:
+                # 用户给所有课程加的 skill
+                - !!js dshHomePath('learn-skills')
+                # 只给当前课程用的 skill（learn use 切换课程时改指向）
+                - !!js dshHomePath('learning') + '/.current/skills'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              # 一次只做一步
+              allowParallelInProgress: false
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024

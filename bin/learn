@@ -1,0 +1,18 @@
+#!/bin/sh
+# learn 启动器：找一个能用的 Node 运行 learn.mjs。
+# 顺序：DSH 桌面版自带的 Electron-as-Node → PATH 上的 node → DSH 安装包里的独立 Node。
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT="$DIR/learn.mjs"
+if [ -n "$DSH_DESKTOP_NODE_EXECUTABLE" ] && [ -x "$DSH_DESKTOP_NODE_EXECUTABLE" ]; then
+  ELECTRON_RUN_AS_NODE=1 exec "$DSH_DESKTOP_NODE_EXECUTABLE" "$SCRIPT" "$@"
+fi
+if node -e '' >/dev/null 2>&1; then
+  exec node "$SCRIPT" "$@"
+fi
+for N in \
+  "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node" \
+  "$HOME/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"; do
+  if [ -x "$N" ]; then exec "$N" "$SCRIPT" "$@"; fi
+done
+echo "错误：找不到可用的 Node。请安装 Node 18+，或确认 DeepSeek Harness 安装完整。" >&2
+exit 127

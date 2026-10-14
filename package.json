@@ -1,0 +1,23 @@
+{
+  "name": "dsh-learn-preset",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 学习教练预设：定目标、摸底、滚动计划、五种教法、跨会话进度。",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "bin",
+    "skills",
+    "docs",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
