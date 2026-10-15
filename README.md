@@ -70,4 +70,11 @@ cordis.patch.yml    预设：人设 + 插件列表
 bin/                进度脚本 learn.mjs 和启动器 learn / learn.ps1
 skills/             4 个流程 skill + 5 个教法 skill
 docs/               方法论、实现方案
+tests/              进度脚本的回归测试
+```
+
+改了 `bin/learn.mjs` 后跑一遍回归测试（需要 node 和 git，用临时目录，不碰真实学习档案）：
+
+```bash
+bash tests/run.sh
 ```

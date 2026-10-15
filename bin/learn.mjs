@@ -1160,7 +1160,8 @@ commands.done = ({ pos, flags }) => {
     const open = l.steps.filter((x) => x.status !== 'done')
     if (open.length === 1 && open[0] === l.steps[l.steps.length - 1]) { open[0].status = 'done'; open[0].result = open[0].result || `未达标：${note}` }
     let added = ''
-    if (l.steps.every((x) => x.status === 'done')) {
+    // 没拆过步骤（想跳过、直接检验没过）：不追加，开始这一节时再细化
+    if (l.steps.length && l.steps.every((x) => x.status === 'done')) {
       const titles = remedy || ['补练没过的那一项', '重新检验']
       l.steps.push(...newSteps(titles))
       added = `已追加 ${titles.length} 步：${titles.join(' → ')}。`
@@ -1365,10 +1366,11 @@ commands.status = ({ flags }) => {
   if (cur?.passCriteria) out.push(criteriaLine(cur))
   // 检验备注：本节检验过就给本节最近一次，否则给最近检验过的那一节（细化新一节时参考）
   const lastNote = (l) => l.notes?.length ? l.notes[l.notes.length - 1] : null
-  if (cur && lastNote(cur)) out.push(`本节上次检验（${lastNote(cur).pass ? '通过' : '未通过'}）：${lastNote(cur).note}`)
+  const clip = (x, n = 150) => (x.length > n ? `${x.slice(0, n)}…` : x)
+  if (cur && lastNote(cur)) out.push(`本节上次检验（${lastNote(cur).pass ? '通过' : '未通过'}）：${clip(lastNote(cur).note)}`)
   else {
     const prev = s.lessons.filter((l) => lastNote(l)).sort((a, b) => lastNote(b).at.localeCompare(lastNote(a).at))[0]
-    if (prev) out.push(`最近一次检验（第 ${prev.id} 节，${lastNote(prev).pass ? '通过' : '未通过'}）：${lastNote(prev).note}`)
+    if (prev) out.push(`最近一次检验（第 ${prev.id} 节，${lastNote(prev).pass ? '通过' : '未通过'}）：${clip(lastNote(prev).note)}`)
   }
   const curMistakes = cur ? s.mistakes.filter((m) => m.lesson === cur.id && !m.graduated) : []
   if (curMistakes.length) out.push(`本节记过的错：${curMistakes.slice(0, 3).map((m) => `${m.id}「${m.wrong}」`).join('；')}${curMistakes.length > 3 ? ` 等 ${curMistakes.length} 条` : ''}`)
@@ -1440,7 +1442,12 @@ commands.prereq = ({ pos, flags }) => {
   const sub = pos[0] || 'show'
   const name = pickCourse(flags)
   const s = loadState(name)
-  if (sub === 'show') return s.prereq ? prereqReport(s) : `还没做先修问答。下一步：${nextSetupStep(s)}`
+  if (sub === 'show') {
+    if (s.prereq) return prereqReport(s)
+    // 早期建的课（有路线、没有先修问答这一步）：不补做，以后需要时再追加
+    if (s.lessons.length) return '这门课建课时还没有先修问答这一步，不用补做。展开新阶段时用 learn prereq set --append 问新用到的技能；课中发现缺本课以外的技能用 learn prereq gap。'
+    return `还没做先修问答。下一步：${nextSetupStep(s)}`
+  }
 
   if (sub === 'set') {
     if (!s.goal) fail('先立目标（learn set-goal），再列先修')
