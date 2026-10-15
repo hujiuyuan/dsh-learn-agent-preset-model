@@ -1679,7 +1679,7 @@ function bridgeGuide(names) {
   相同：1-3 点
   不同：至少 1 点，附最小例子
   别套用：什么情况下按 X 的习惯会出错
-（X 指上面某个技能）讲完接本课的正式说法和一个最小例子，再出 1 道针对「不同」的预测题。看着一样、行为不同的地方，先让用户按 X 的经验预测，答错再纠正，并 learn mistake <节> "<错>" "<对>" --from X。X 里没有对应物的，直说「这里别用 X 的思路」。`
+（X 指上面某个技能）讲完接本课的正式说法和一个最小例子（完整代码和真实输出），问用户看懂没有；看懂了再出 1 道针对「不同」、按 X 的习惯会做错的预测题，题里只用讲过的写法和词，答错再纠正，并 learn mistake <节> "<错>" "<对>" --from X。X 里没有对应物的，直说「这里别用 X 的思路」。`
 }
 
 // 跨课程统计各教法的首次检验通过率；每种满 3 节才算
@@ -2106,7 +2106,7 @@ commands.switch = ({ pos, flags }) => {
   const from = l.method
   l.method = m
   l.methodReason = reason
-  l.methodHistory.push(m)
+  if (l.methodHistory[l.methodHistory.length - 1] !== m) l.methodHistory.push(m)
   if (flags.steps) {
     const steps = parseSteps(flags.steps)
     const kept = l.steps.filter((x) => x.status === 'done')
@@ -2114,7 +2114,13 @@ commands.switch = ({ pos, flags }) => {
     delete l.directCheck
   }
   saveState(name, s, `第 ${l.id} 节换教法：${METHOD_NAMES[from] || '无'} → ${METHOD_NAMES[m]}，原因：${reason}`)
-  return `已换成${METHOD_NAMES[m]}。\n${positionLine(s)}`
+  const left = l.steps.filter((x) => x.status !== 'done')
+  const tip = []
+  if (l.status !== 'in_progress') tip.push(`开讲这节时 learn start ${l.id}，再加载 skill teach-${m}。`)
+  else if (!left.length) tip.push(`步骤都做完了：先 learn done ${l.id} --pass|--fail --note "…" 判定；要按新教法补练就加 --steps '[…]'。`)
+  else tip.push(`加载 skill teach-${m}，按它的做法接着教。`)
+  if (!flags.steps && left.length && from !== m) tip.push(`剩下的 ${left.length} 步是按${METHOD_NAMES[from] || '原来的教法'}拆的（${left.map((x) => `「${x.title}」`).join('')}），和新教法对不上就重拆：learn switch ${l.id} ${m} "<原因>" --steps '[…]'（做完的步骤会保留）。`)
+  return `已换成${METHOD_NAMES[m]}。${tip.join('')}\n${positionLine(s)}`
 }
 
 commands.done = ({ pos, flags }) => {
@@ -2242,7 +2248,7 @@ commands.ask = ({ pos, flags }) => {
   const id = `q${s.questions.length + 1}`
   s.questions.push({ id, lesson: flags.lesson ? Number(flags.lesson) : cur?.id ?? null, text, status: 'open', askedAt: isoLocal(), answer: null })
   saveState(name, s, `疑问 ${id}：${text}`)
-  return `已记为 ${id}（未解决）。问的是本课以外的技能（如「X 是什么」）且卡住了本节，再 learn prereq gap "X" --reason "…"。`
+  return `已记为 ${id}（未解决）。这一轮只讲不出题：用户没看懂的，换一个更具体的例子讲（没见过的写法给完整代码和真实输出），不要把原来的说法换几个字再说；讲完问看懂没有，用户说懂了再 learn answer ${id} "<一句话结论>"。问的是本课以外的技能（如「X 是什么」）且卡住了本节，再 learn prereq gap "X" --reason "…"。`
 }
 
 commands.answer = ({ pos, flags }) => {
@@ -2349,6 +2355,8 @@ commands.status = ({ flags }) => {
   const orphan = orphanPrereqLessons(s)
   if (orphan.length) out.push(`⚠ ${orphanText(orphan)}`)
   if (cur?.passCriteria) out.push(criteriaLine(cur))
+  const brief = (x) => (x.length > 40 ? `${x.slice(0, 40)}…` : x)
+  if (cur && cur.status === 'todo' && !cur.method && s.baseline.length) out.push(`摸底（细化这节、选教法时看）：${s.baseline.map((b) => `${b.ability}=${b.level}${b.level === 'none' ? `（${brief(b.evidence)}）` : ''}`).join('，')}`)
   // 检验备注：本节检验过就给本节最近一次，否则给最近检验过的那一节（细化新一节时参考）
   const lastNote = (l) => l.notes?.length ? l.notes[l.notes.length - 1] : null
   const clip = (x, n = 150) => (x.length > n ? `${x.slice(0, n)}…` : x)

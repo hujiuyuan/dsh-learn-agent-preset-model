@@ -35,7 +35,7 @@ o=$(L baseline --json '[{"ability":"控制器","level":"none","evidence":"第1�
 o=$(L set-plan --json '[{"id":1,"title":"控制器","uses":["SQL"]},{"id":2,"title":"分层","requires":[1]}]'); has "下一节：第 1 节「控制器」" "$o"
 o=$(L status); has "边学边补的先修：SQL（第 1 节要用）" "$o"; has "可类比（用户会的技能）：" "$o"
 o=$(L start 1 --method worked-example --criteria "能写出 GET 接口" --check "费曼+1题" --steps '["示范","练习","检验"]'); has "本节先补先修「SQL」" "$o"; has "〔用你会的 X 打个比方〕" "$o"; has "本节达标标准：能写出 GET 接口；检验方式：费曼+1题" "$o"
-o=$(L status); has "〔用你会的 X 打个比方〕" "$o"; has "本节达标标准：能写出 GET 接口" "$o"
+o=$(L status); has "〔用你会的 X 打个比方〕" "$o"; has "问用户看懂没有；看懂了再出 1 道" "$o"; has "本节达标标准：能写出 GET 接口" "$o"
 o=$(L step 1 1 --result ok); has "第 2/3 步" "$o"
 o=$(L done 1 --pass --note ok); has "下一节：第 2 节" "$o"
 
@@ -657,7 +657,7 @@ fresh T29; L init c1 >/dev/null; printf 'x' > $LEARN_HOME/c1/.DS_Store; git -C $
 L list >/dev/null; o=$(git -C $LEARN_HOME ls-files); hasnt ".DS_Store" "$o"
 # 清理失效锁的「接管锁」本身残留了：照样能拿到锁
 echo 999999 > $LEARN_HOME/.learn.lock; touch -t 202001010000 $LEARN_HOME/.learn.lock; : > $LEARN_HOME/.learn.lock.takeover.tmp; touch -t 202001010000 $LEARN_HOME/.learn.lock.takeover.tmp
-o=$(L ask "锁残留后"); has "已记为" "$o"; [ ! -e $LEARN_HOME/.learn.lock ] && ok || bad "数据锁没放掉"
+o=$(L ask "锁残留后"); has "已记为" "$o"; has "这一轮只讲不出题" "$o"; has "learn answer q" "$o"; [ ! -e $LEARN_HOME/.learn.lock ] && ok || bad "数据锁没放掉"
 # 用户全局开了提交签名、配了会失败的钩子：学习记录照常提交
 G=$(mktemp -d); mkdir -p $G/hooks; printf '#!/bin/sh\nexit 1\n' > $G/hooks/pre-commit; chmod +x $G/hooks/pre-commit
 printf '[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /usr/bin/false\n[core]\n\thooksPath = %s/hooks\n' "$G" > $G/gitconfig
@@ -844,5 +844,32 @@ const d=p.skills[0]; p.skills=[]; for(let i=1;i<=49;i++) p.skills.push({...JSON.
 require("fs").writeFileSync(f,JSON.stringify(p))'
 L prereq set --append --json '[{"name":"Ruby","role":"core","reason":"r"},{"name":"Perl","role":"core","reason":"r"}]' >/dev/null
 o=$(L prereq answer --json '[{"name":"Ruby","choice":"A"},{"name":"Perl","choice":"B"}]'); has "画像：已记入 「Ruby」" "$o"; has "⚠ 「Perl」没记入：画像里技能已满 50 条" "$o"
+
+# T31 没见过的先讲：换教法提示加载新 skill 和重拆步骤；没细化的节在 status 里看得到摸底；人设和 skill 长度
+fresh T31
+L init np --title N >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L baseline --json '[{"ability":"numpy","level":"none","evidence":"没接触过"}]' >/dev/null
+L set-plan --json '[{"id":1,"title":"数组"},{"id":2,"title":"形状"}]' >/dev/null
+o=$(L status); has "摸底（细化这节、选教法时看）：numpy=none（没接触过）" "$o"
+L start 1 --method first-principles --criteria c --steps '["暴露假设","基本事实","一步步推","费曼检验"]' >/dev/null
+o=$(L status); hasnt "摸底（细化这节" "$o"
+o=$(L switch 1 worked-example "从没接触过，先讲"); has "加载 skill teach-worked-example，按它的做法接着教。" "$o"; has "剩下的 4 步是按第一性原理拆的（「暴露假设」「基本事实」「一步步推」「费曼检验」）" "$o"; has "learn switch 1 worked-example \"<原因>\" --steps" "$o"
+o=$(L switch 1 worked-example "重拆" --steps '["示范","补全题","独立题","费曼检验"]'); hasnt "剩下的" "$o"; has "第 1/4 步：示范 · 下一步：补全题" "$o"
+o=$(J np 's.lessons[0].methodHistory.join(",")'); [ "$o" = '"first-principles,worked-example"' ] && ok || bad "同一教法再 switch 不该重复记进教法历史" "$o"
+o=$(L switch 2 coach "还没开讲"); has "开讲这节时 learn start 2，再加载 skill teach-coach。" "$o"; hasnt "按它的做法接着教" "$o"
+for i in 1 2 3 4; do L step 1 $i --result r >/dev/null; done
+o=$(L switch 1 coach "做完了再换"); has "步骤都做完了：先 learn done 1" "$o"; hasnt "按它的做法接着教" "$o"
+L done 1 --pass --note ok >/dev/null; L review --lesson 1 --reason "忘了" >/dev/null
+o=$(L status); hasnt "摸底（细化这节" "$o"
+ROOT=$(cd "$(dirname "$P")/.." && pwd)
+o=$(node -e '
+const fs=require("fs"),r=process.argv[1]
+const y=fs.readFileSync(r+"/cordis.patch.yml","utf8")
+const m=y.split("prefix: |-\n")[1].split("\n          - id: agent-instructions")[0]
+const t=m.split("\n").map((l)=>l.replace(/^ {16}/,"")).join("\n")
+const out=[]
+if(t.length>2500) out.push("人设 "+t.length+" 字，超过 2500")
+for(const d of fs.readdirSync(r+"/skills")){const n=fs.readFileSync(r+"/skills/"+d+"/SKILL.md","utf8").length;if(n>=8192) out.push(d+" "+n+" 字，会被截断")}
+console.log(out.join("；")||"ok")' "$ROOT"); [ "$o" = ok ] && ok || bad "长度超限" "$o"
 
 echo "通过 $PASS 项，失败 $FAILN 项"
