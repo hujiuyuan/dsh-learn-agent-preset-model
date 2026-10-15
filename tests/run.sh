@@ -23,7 +23,7 @@ o=$(L cues --dir $D); has "Spring Boot ← pom.xml（文件里提到它）" "$o"
 o=$(L set-plan --json '[{"id":1,"title":"a"}]'); has "还没做先修问答" "$o"
 o=$(L prereq set --json '[{"name":"Java","role":"core","reason":"写控制器"},{"name":"SQL","role":"general","reason":"写查询"},{"name":"Express","role":"related","reason":"路由可类比","cue":"package.json"}]'); has "下一步：用 1 次 ask_user_question 一起问下面 3 项会不会，每项一题（问会不会不占验证题名额）" "$o"; has "Express：本课用它路由可类比（看到 package.json 才问的，题面说出来）" "$o"; has "先修清单（3 项，本批验证题已出 0/4）" "$o"
 o=$(L status); has "状态：还没出计划。下一步：先修问答还没完（learn-intake 第 3 步）" "$o"; c=$(printf '%s' "$o" | grep -c "下一步"); [ "$c" = 1 ] && ok || bad "status 里下一步不唯一($c)" "$o"
-o=$(L prereq answer Java A); has "Java [必需] 写控制器 → 待出验证题" "$o"; has "下面 2 项还没记会不会。用户在刚才那次提问里已经答了的，直接逐项记，不要再问" "$o"; hasnt "出 1 道验证题" "$o"
+o=$(L prereq answer Java A); has "Java [必需] 写控制器 → 待出验证题" "$o"; has "下面 2 项还没记会不会。用户在刚才那次提问里已经答了的，直接记，不要再问" "$o"; hasnt "出 1 道验证题" "$o"
 o=$(L prereq answer SQL C); has "SQL [有帮助] 写查询 → 待定怎么补" "$o"; has "下面 1 项还没记会不会" "$o"; has "  Express：本课用它" "$o"
 o=$(L prereq answer Express A); has "（看到 package.json 问的）" "$(PJ 'p.skills.map(s=>s.evidence.map(e=>e.detail)).flat()')"; has "下一步：给「Java」出 1 道验证题（本批验证题已出 0/4）。一次只出这一题：ask_user_question 里只放这一题" "$o"; has "选择题选对了，先追问一句「为什么」再判" "$o"
 o=$(L prereq quiz Java mastered --detail "预测 equals 与 == 输出并说出原因"); has "Java [必需] 写控制器 → 已会，不用补" "$o"; has "下一步：给「Express」出 1 道验证题（本批验证题已出 1/4）" "$o"
@@ -282,7 +282,7 @@ L prereq set --json '[{"name":"Java","role":"core","reason":"a"}]' >/dev/null; L
 L baseline --json '[{"ability":"a","level":"none","evidence":"x"}]' >/dev/null; L set-plan --json '[{"id":1,"title":"A"}]' >/dev/null
 L prereq gap Docker --reason "要起容器" >/dev/null
 o=$(L prereq set --append --json '[{"name":"Redis","role":"core","reason":"缓存"}]'); has "本批验证题已出 0/4" "$o"
-o=$(L prereq answer Redis C); has "用户在刚才的问题里已经选过的，直接逐项记，不要再问" "$o"
+o=$(L prereq answer Redis C); has "用户在刚才的问题里已经选过的，直接记，不要再问" "$o"
 L prereq gap Kafka --reason "要发消息" >/dev/null
 L prereq decide Redis inline >/dev/null; L prereq decide Docker inline >/dev/null
 o=$(L prereq decide Kafka inline); has "按 learn-plan 排新阶段的节" "$o"
@@ -742,5 +742,107 @@ printf '#!/bin/sh\nsleep 2\nexit 0\n' > $SD/r.git/hooks/pre-receive; chmod +x $S
 SA ask "q1" >/dev/null; sleep 0.5; SA ask "q2" >/dev/null; h=$(git -C $SD/a rev-parse HEAD); br=$(git -C $SD/a symbolic-ref --short HEAD)
 for i in $(seq 1 40); do [ "$(git -C $SD/r.git rev-parse $br 2>/dev/null)" = "$h" ] && break; sleep 0.5; done
 o=$(git -C $SD/r.git rev-parse $br); [ "$o" = "$h" ] && ok || bad "连着两条命令后最后一条没推上去" "$o $h"
+
+# ---------- T30 实测后补：先修一次记几项、画像回执放最后、说这节会了就直接检验 ----------
+fresh T30
+L init sb --title "SB" >/dev/null
+L set-goal --json '{"exam":"e","profileSkill":"SB"}' >/dev/null
+L prereq set --json '[{"name":"Java","role":"core","reason":"a"},{"name":"SQL","role":"core","reason":"b"},{"name":"Maven","role":"general","reason":"c"},{"name":"Express","role":"related","reason":"d","cue":"package.json"},{"name":"Vue","role":"related","reason":"e"}]' >/dev/null
+o=$(L prereq); has "答完用一条命令一起记：learn prereq answer --json" "$o"
+# 整批校验：有一项不合法就整批不记，画像也不写
+o=$(L prereq answer --json '[{"name":"Java","choice":"B"},{"name":"SQL","choice":"X"}]'); has "「SQL」的选项只能是 A" "$o"
+o=$(J sb 's.prereq.items.filter(x=>x.answer).length'); [ "$o" = 0 ] && ok || bad "整批不合法时不该记任何一项" "$o"
+[ -f $LEARN_HOME/profile.json ] && bad "整批不合法时不该写画像" "$(cat $LEARN_HOME/profile.json)" || ok
+o=$(L prereq answer --json '[{"name":"Java","choice":"B"},{"name":"java","choice":"A"}]'); has "「Java」写了两次" "$o"
+o=$(L prereq answer --json '[{"name":"Java"}]'); has "缺少「Java」的 choice" "$o"
+o=$(L prereq answer --json '{"name":"Java"}'); has "--json 要是非空数组" "$o"
+o=$(L prereq answer --json '[{"name":"Java","choice":"b","quote":"写过一点"},{"name":"SQL","choice":"A"},{"name":"Maven","choice":"C"},{"name":"Express","choice":"A"},{"name":"Vue","choice":"D"}]')
+has "画像：已记入 「Java」e1 自述会一点 → 现在算会一点" "$o"; has "；「SQL」e2 自述已会 → 现在算会一点" "$o"; has "；「Express」e4 自述已会" "$o"
+has "。「Vue」选了「不确定」，不记入。哪条不对，说「删掉某某那条」就删。" "$o"; has "把下面的画像回执一字不改贴给用户" "$o"; has "画像存在 " "$o"
+c=$(printf '%s' "$o" | grep -c "先修清单"); [ "$c" = 1 ] && ok || bad "一次记几项只该输出一份清单($c)" "$o"
+last=$(printf '%s\n' "$o" | grep -v '^画像存在' | grep . | tail -1); case "$last" in 画像：已记入*) ok;; *) bad "画像回执应在最后" "$o";; esac
+has "Java [必需] a → 待出验证题" "$o"; has "Maven [有帮助] c → 待定怎么补（推荐：边学边补）" "$o"; has "Vue [可类比] e → 不拿来打比方" "$o"; has "下一步：给「Java」出 1 道验证题" "$o"
+o=$(J sb 's.prereq.items.map(x=>x.name+x.answer).join()'); [ "$o" = '"JavaB,SQLA,MavenC,ExpressA,VueD"' ] && ok || bad "几项的答案没记对" "$o"
+o=$(PJ 'p.skills.find(s=>s.name==="Java").evidence[0].detail+"|"+p.skills.find(s=>s.name==="Express").evidence[0].ref'); has "「写过一点」|prereq-a4" "$o"
+o=$(git -C $LEARN_HOME log -1 --format=%s); has "先修「Java」：选 B，「SQL」：选 A，「Maven」：选 C" "$o"
+o=$(L prereq answer Java A); has "现在不需要问会不会" "$o"
+# 验证题：画像回执在最后；选对了追问「为什么」时不给选项
+o=$(L prereq quiz Java partial --detail q); last=$(printf '%s\n' "$o" | grep . | tail -1); case "$last" in 画像：已记入「Java」*) ok;; *) bad "验证题的画像回执应在最后" "$o";; esac
+has "先追问一句「为什么」再判：让用户用自己的话说，不给选项" "$o"; has "考「Express」本身，不考本课要学的新东西" "$o"; has "把下面的画像回执一字不改贴给用户" "$o"
+L prereq quiz Express mastered --detail q >/dev/null; L prereq quiz SQL none --detail q >/dev/null
+# 怎么补：一起记，整批校验
+o=$(L prereq); has "答完用一条命令一起记：learn prereq decide --json" "$o"
+o=$(L prereq decide --json '[{"name":"Java","decision":"inline"},{"name":"SQL","decision":"bogus"}]'); has "决定只能是" "$o"
+o=$(J sb 's.prereq.items.find(x=>x.name==="Java").state'); [ "$o" = '"decide"' ] && ok || bad "整批不合法时不该记任何一项" "$o"
+o=$(L prereq decide --json '[{"name":"Java","decision":"inline"},{"name":"Java","decision":"skip"}]'); has "「Java」写了两次" "$o"
+o=$(L prereq decide --json '[{"name":"Java","decision":"inline"},{"name":"SQL","decision":"learn-first","note":"想先打牢"},{"name":"Maven","decision":"skip"}]')
+has "Java [必需] a → 边学边补" "$o"; has "SQL [必需] b → 先补（加先修节）（想先打牢）" "$o"; has "Maven [有帮助] c → 跳过" "$o"; has "先修问答完成" "$o"
+o=$(git -C $LEARN_HOME log -1 --format=%s); has "先修怎么补：Java=边学边补，SQL=先补（加先修节），Maven=跳过" "$o"
+# 说这节会了：讲解和练习记成跳过，位置条指到检验
+L baseline --json '[{"ability":"x","level":"none","evidence":"q"}]' >/dev/null
+L set-plan --json '[{"id":1,"kind":"prereq","prereqSkill":"SQL","title":"SQL 先修"},{"id":2,"title":"起项目","requires":[1]},{"id":3,"title":"分层","requires":[2]}]' >/dev/null
+o=$(L check 2); has "前置第 1 节「SQL 先修」还没掌握" "$o"
+L start 1 --method worked-example --criteria c --steps '["探测","示范","练习","费曼检验"]' >/dev/null
+L step 1 1 --result r >/dev/null
+o=$(L check 1 --reason "用户说学过"); has "已跳到检验。过了就算掌握（learn done 1 --pass" "$o"; has "📍 第 1 节「SQL 先修」（先修） · 第 4/4 步：费曼检验 · 这是最后一步" "$o"
+o=$(J sb 's.lessons[0].steps.map(x=>x.status+":"+(x.result||"")).join("|")'); has "done:r|done:跳过：用户说学过|done:跳过：用户说学过|in_progress:" "$o"
+o=$(L done 1 --fail --note "讲不清"); has "已追加 2 步：补练没过的那一项 → 重新检验" "$o"
+o=$(L check 1); has "第 6/6 步：重新检验 · 这是最后一步" "$o"
+o=$(L done 1 --pass --note ok); has "下一节：第 2 节「起项目」" "$o"
+o=$(L check 1); has "第 1 节已经掌握了" "$o"
+# 没开始的节也能直接检验：加一步「直接检验」；再说一次不重复加
+o=$(L check 2); has "第 1/1 步：直接检验 · 这是最后一步" "$o"
+o=$(L check 2); has "第 1/1 步：直接检验" "$o"
+# 另一节做到一半：先暂停它
+L done 2 --pass --note ok >/dev/null
+L start 3 --method coach --criteria c --steps '["探测","练习","费曼检验"]' >/dev/null; L step 3 1 --result r >/dev/null
+L set-plan --json '[{"id":1,"kind":"prereq","prereqSkill":"SQL","title":"SQL 先修"},{"id":2,"title":"起项目","requires":[1]},{"id":3,"title":"分层","requires":[2]},{"id":4,"title":"收尾","requires":[2]}]' >/dev/null
+o=$(L check 4); has "第 3 节做到第 1/3 步还没检验，已暂停" "$o"; has "📍 第 4 节「收尾」 · 第 1/1 步：直接检验" "$o"
+o=$(J sb 's.lessons[2].status'); [ "$o" = '"todo"' ] && ok || bad "另一节该暂停" "$o"
+L done 4 --pass --note ok >/dev/null
+# 直接检验的节不算进教法效果
+L start 3 >/dev/null; L check 3 >/dev/null; L done 3 --pass --note ok >/dev/null
+o=$(J sb 's.lessons[2].notes[0].direct+"|"+s.lessons[2].directCheck'); [ "$o" = '"true|undefined"' ] && ok || bad "直接检验该记在检验记录上，节上的标记要清掉" "$o"
+for c in c1 c2; do L init $c --title $c >/dev/null; L set-goal --c $c --json '{"exam":"e"}' >/dev/null; L prereq set --c $c --none n >/dev/null; L baseline --c $c --json '[{"ability":"x","level":"none","evidence":"q"}]' >/dev/null; L set-plan --c $c --json '[{"id":1,"title":"t"}]' >/dev/null; L start 1 --c $c --method coach --criteria c --steps '["a","费曼检验"]' >/dev/null; L done 1 --c $c --pass --note ok >/dev/null; done
+o=$(L profile); hasnt "练习批改 3/3" "$o"; hasnt "练习批改" "$o"
+# 先照常教、首次检验没过，后来用户说会了再直接检验：首次那次照算
+L init c3 --title c3 >/dev/null; L set-goal --c c3 --json '{"exam":"e"}' >/dev/null; L prereq set --c c3 --none n >/dev/null; L baseline --c c3 --json '[{"ability":"x","level":"none","evidence":"q"}]' >/dev/null; L set-plan --c c3 --json '[{"id":1,"title":"t"},{"id":2,"title":"t2"}]' >/dev/null
+L start 1 --c c3 --method coach --criteria c --steps '["a","费曼检验"]' >/dev/null; L step 1 1 --c c3 --result r >/dev/null; L done 1 --c c3 --fail --note x >/dev/null
+L check 1 --c c3 >/dev/null; L done 1 --c c3 --pass --note ok >/dev/null
+o=$(L profile); has "练习批改 2/3" "$o"
+# 直接检验后又决定学：start --steps 重拆就不算直接检验
+L check 2 --c c3 >/dev/null; o=$(J c3 's.lessons[1].directCheck'); [ "$o" = true ] && ok || bad "check 后节上该有标记" "$o"
+L set-plan --c c3 --json '[{"id":1,"title":"t"},{"id":2,"title":"t2"},{"id":3,"title":"t3"}]' >/dev/null
+o=$(J c3 's.lessons[1].directCheck'); [ "$o" = true ] && ok || bad "改路线不该丢掉直接检验的标记" "$o"
+L start 2 --c c3 --method coach --criteria c --steps '["a","费曼检验"]' --force yes >/dev/null; L step 2 1 --c c3 --result r >/dev/null; L done 2 --c c3 --pass --note ok >/dev/null
+o=$(J c3 's.lessons[1].notes[0].direct'); [ "$o" = "" ] || [ "$o" = undefined ] && ok || bad "重拆步骤后照常教的检验不该标直接检验" "$o"
+o=$(L profile); has "练习批改 3/4" "$o"
+# 需复习的节：追加一步检验
+L review --c c3 --lesson 1 --reason "忘了" >/dev/null
+o=$(L check 1 --c c3); has "第 5/5 步：直接检验 · 这是最后一步" "$o"; hasnt "步骤都做完了" "$o"
+o=$(L done 1 --c c3 --pass --note ok); has "下一节" "$o"
+o=$(L check 3 --c c3); has '没过（learn done 3 --fail --note "…"）' "$o"
+# 直接检验后换教法重拆步骤：也不再算直接检验
+L switch 3 --c c3 first-principles "用户想学" --steps '["讲","费曼检验"]' >/dev/null
+o=$(J c3 's.lessons[2].directCheck'); [ "$o" = "" ] || [ "$o" = undefined ] && ok || bad "switch 重拆步骤该清掉直接检验的标记" "$o"
+
+# 一项一项记照旧；只有「不确定」时不碰画像
+fresh T30b
+L init x --title X >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null
+L prereq set --json '[{"name":"Go","role":"related","reason":"r"}]' >/dev/null
+o=$(L prereq answer Go D); has "画像：选了「不确定」，不记入。" "$o"; [ -f $LEARN_HOME/profile.json ] && bad "选「不确定」不该写画像" "" || ok
+L prereq set --append --json '[{"name":"Rust","role":"related","reason":"r"},{"name":"Zig","role":"related","reason":"r"}]' >/dev/null
+o=$(L prereq answer --json '[{"name":"Rust","choice":"D"},{"name":"Zig","choice":"C"}]'); has "画像：已记入 「Zig」e1 自述不会" "$o"; has "。「Rust」选了「不确定」，不记入。" "$o"
+L profile off >/dev/null
+L prereq set --append --json '[{"name":"C","role":"core","reason":"r"},{"name":"Lua","role":"core","reason":"r"}]' >/dev/null
+o=$(L prereq answer --json '[{"name":"C","choice":"A"},{"name":"Lua","choice":"B"}]'); has "画像：已暂停，这次没有记入" "$o"; c=$(printf '%s' "$o" | grep -c "画像："); [ "$c" = 1 ] && ok || bad "暂停时只该有一行画像提示($c)" "$o"
+# 一次记几项时，一项写不进（画像满了）不连累别的项：先放 49 个技能，第 50 个能记，第 51 个记不进
+L profile on >/dev/null
+node -e '
+const f=process.env.LEARN_HOME+"/profile.json", p=require(f);
+const d=p.skills[0]; p.skills=[]; for(let i=1;i<=49;i++) p.skills.push({...JSON.parse(JSON.stringify(d)),id:"s"+(100+i),name:"T"+i,evidence:d.evidence.map((e,j)=>({...e,id:"e"+(1000+i*10+j)}))});
+require("fs").writeFileSync(f,JSON.stringify(p))'
+L prereq set --append --json '[{"name":"Ruby","role":"core","reason":"r"},{"name":"Perl","role":"core","reason":"r"}]' >/dev/null
+o=$(L prereq answer --json '[{"name":"Ruby","choice":"A"},{"name":"Perl","choice":"B"}]'); has "画像：已记入 「Ruby」" "$o"; has "⚠ 「Perl」没记入：画像里技能已满 50 条" "$o"
 
 echo "通过 $PASS 项，失败 $FAILN 项"

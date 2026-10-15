@@ -1397,7 +1397,8 @@ function checkSkillName(name, what = '技能名') {
 }
 
 // 加一条证据；返回回执。调用方须在 withProfile 里
-function addEvidence(p, { name, type, level, course = null, ref, detail }) {
+// brief：几条一起记时只返回这一条的短回执，由调用方合成一行
+function addEvidence(p, { name, type, level, course = null, ref, detail }, { brief = false } = {}) {
   if (!LEVELS.includes(level)) fail(`档位非法：${level}（mastered / partial / none）`)
   name = checkSkillName(name)
   let sk = findSkill(p, name)
@@ -1414,7 +1415,7 @@ function addEvidence(p, { name, type, level, course = null, ref, detail }) {
   }
   // 同一次操作重复写入才算重复：编号相同、内容也相同（选边同步后课程里的编号可能退回去，同号的新结果要照记）
   if (ref && sk.evidence.some((e) => e.ref === ref && e.course === course && e.type === type && e.level === level && (e.detail || null) === (detail || null))) {
-    return `画像：「${sk.name}」已有这条记录（${ref}），没有重复记入。`
+    return brief ? `「${sk.name}」已有这条记录，没有重复记入` : `画像：「${sk.name}」已有这条记录（${ref}），没有重复记入。`
   }
   p.seq.e += 1
   const e = { id: `e${p.seq.e}${idTag()}`, type, level, at: dateLocal(), ts: now().toISOString(), course, ref: ref || null, detail: detail || null }
@@ -1430,6 +1431,7 @@ function addEvidence(p, { name, type, level, course = null, ref, detail }) {
   }
   sk.lastUsedAt = isoLocal()
   const lv = skillLevel(sk)
+  if (brief) return `「${sk.name}」${e.id} ${EVIDENCE_NAMES[type]}${LEVEL_NAMES[level]} → 现在算${levelText(lv)}`
   const first = p.skills.length === 1 && sk.evidence.length === 1 && created
   return `画像：已记入「${sk.name}」${e.id}（${EVIDENCE_NAMES[type]}：${LEVEL_NAMES[level]}），现在算${levelText(lv)}。不对就说「删掉这条」（learn profile forget ${e.id} --name "${sk.name}"）。`
     + (first ? `\n画像存在 ${PROFILE}，只记学习相关的技能；查看：learn profile` : '')
@@ -1443,6 +1445,9 @@ function profileWriteSafe(fn) {
     return `⚠ 画像未写入：${e.message}`
   }
 }
+
+// 主命令顺带写的画像回执：前面加一句给模型的指令（光靠人设，实测模型常常不转告或改写）
+const relay = (receipt) => `把下面的画像回执一字不改贴给用户（用户靠它知道记了什么、怎么删）：\n${receipt}`
 
 // ---------- 先修问答 ----------
 // s.prereq = { setAt, none, asked, quizSeq, qStart, batchNo, batchKind,
@@ -1568,20 +1573,20 @@ function prereqStep(s) {
     // 同一批已经记过答案：剩下的多半在刚才那次提问里答过了，直接记，别再问一遍
     const answered = s.prereq.items.some((x) => inBatch(s, x) && x.answer)
     const head = answered
-      ? `下一步：下面 ${asks.length} 项还没记会不会。用户在刚才那次提问里已经答了的，直接逐项记，不要再问；还没问过的，用 1 次 ask_user_question 一起问（问会不会不占验证题名额）：\n`
+      ? `下一步：下面 ${asks.length} 项还没记会不会。用户在刚才那次提问里已经答了的，直接记，不要再问；还没问过的，用 1 次 ask_user_question 一起问（问会不会不占验证题名额）：\n`
       : asks.length === 1
         ? `下一步：用 ask_user_question 问「${asks[0].name}」会不会（问会不会不占验证题名额）：\n`
         : `下一步：用 1 次 ask_user_question 一起问下面 ${asks.length} 项会不会，每项一题（问会不会不占验证题名额）：\n`
     return head
       + asks.map((x) => `  ${x.name}：本课用它${x.reason}${x.cue ? `（看到 ${x.cue} 才问的，题面说出来）` : ''}`).join('\n')
       + '\n每题题面问一个具体任务，不问笼统水平；选项固定：A 能独立做 / B 会一点，要查资料 / C 没接触过 / D 不确定。'
-      + '\n答完逐项记：learn prereq answer "<技能>" <A|B|C|D> [--quote "<用户原话>"]'
+      + '\n答完用一条命令一起记：learn prereq answer --json \'[{"name":"<技能>","choice":"A|B|C|D","quote":"<用户原话，可省略>"}]\'（只有一项也可以 learn prereq answer "<技能>" <A|B|C|D>）'
   }
   const it = settleQuizzes(s)[0]
   if (it) {
     return `下一步：给「${it.name}」出 1 道验证题（本批验证题已出 ${quizzesInBatch(s)}/${PREREQ_BUDGET}）。一次只出这一题：ask_user_question 里只放这一题，记下结果再出下一题。\n`
-      + `出题：预测输出、找错或解释为什么，不问定义，贴近本课用它的地方（${it.reason}）。用选择题时，有且只有一个选项是对的，选项说明不暗示对错，最后一项是「不确定 / 说不清」。\n`
-      + '判档：答错 none；答对但没说原因 partial（选择题选对了，先追问一句「为什么」再判）；答对且原因说得通 mastered。\n'
+      + `出题：考「${it.name}」本身，不考本课要学的新东西；预测输出、找错或解释为什么，不问定义，贴近本课用它的地方（${it.reason}）。用选择题时，有且只有一个选项是对的，选项只写选项本身、不加说明，最后一项是「不确定 / 说不清」。\n`
+      + '判档：答错 none；答对但没说原因 partial（选择题选对了，先追问一句「为什么」再判：让用户用自己的话说，不给选项）；答对且原因说得通 mastered。\n'
       + `答完：learn prereq quiz "${it.name}" <mastered|partial|none> --detail "<题目要点和回答>"（--detail 里不写 ${BANNED_WORDS.join('、')}）`
   }
   const dec = s.prereq.items.filter((x) => x.state === 'decide')
@@ -1589,8 +1594,8 @@ function prereqStep(s) {
     return `下一步：用一个问题问用户这几项先修怎么补（每项先说本课用它做什么，再给 4 个选项和各自后果，标出推荐项；多项时加一个「全部按推荐」）：\n`
       + dec.map((x) => `  ${x.name}：推荐「${DECISION_NAMES[x.recommend]}」${x.note ? `（${x.note}）` : ''}`).join('\n')
       + '\n选项：learn-first 先补 / inline 边学边补 / separate 先单独学一门 / skip 跳过'
-      + '\n用户在刚才的问题里已经选过的，直接逐项记，不要再问。'
-      + '\n答完：learn prereq decide "<技能>" <learn-first|inline|separate|skip>；全部按推荐：learn prereq decide --all-recommended'
+      + '\n用户在刚才的问题里已经选过的，直接记，不要再问。'
+      + '\n答完用一条命令一起记：learn prereq decide --json \'[{"name":"<技能>","decision":"learn-first|inline|separate|skip"}]\'；全部按推荐：learn prereq decide --all-recommended'
   }
   return null
 }
@@ -1685,7 +1690,8 @@ function methodStats() {
     let s
     try { s = loadState(n) } catch { continue }
     for (const l of s.lessons) {
-      if (!l.notes || !l.notes.length || l.kind === 'prereq') continue
+      // 首次检验是跳过讲解直接检验的，不算：跟教法无关
+      if (!l.notes || !l.notes.length || l.kind === 'prereq' || l.notes[0].direct) continue
       const m = l.notes[0].method || l.methodHistory?.[0] || l.method
       if (!m || m === 'feynman') continue
       by[m] = by[m] || { lessons: 0, firstPass: 0 }
@@ -1949,6 +1955,7 @@ commands['set-plan'] = ({ flags }) => {
       prereqSkill: n.prereqSkill || null,
       uses: n.uses || [],
       forced: o.forced || false,
+      ...(o.directCheck ? { directCheck: true } : {}),
     }
   })
   // 进行中的节多了没学完的前置（新插的先修节或过渡节）：先暂停它，做过的步骤保留
@@ -1998,7 +2005,7 @@ commands.start = ({ pos, flags }) => {
   if (flags.reason) l.methodReason = flags.reason
   if (flags.criteria) l.passCriteria = flags.criteria
   if (flags.check) l.check = flags.check
-  if (flags.steps) l.steps = newSteps(parseSteps(flags.steps))
+  if (flags.steps) { l.steps = newSteps(parseSteps(flags.steps)); delete l.directCheck }
   if (!l.method) fail('这一节还没定教法，用 --method 指定')
   if (!l.passCriteria) fail('这一节还没有达标标准，用 --criteria 指定')
   if (!l.steps.length) fail('这一节还没拆步骤，用 --steps \'["...","..."]\' 指定（每步 10-15 分钟）')
@@ -2049,6 +2056,46 @@ commands.step = ({ pos, flags }) => {
   return positionLine(s)
 }
 
+// 用户说这节会了、想跳过：讲解和练习的步骤记成「跳过」，位置条直接指到检验
+commands.check = ({ pos, flags }) => {
+  const name = pickCourse(flags)
+  const s = loadState(name)
+  const l = lesson(s, intArg(pos[0], '节号'))
+  if (l.status === 'mastered') fail(`第 ${l.id} 节已经掌握了`)
+  const unmet = unmetRequires(s, l)
+  if (unmet.length && !flags.force) {
+    const p = lesson(s, unmet[0])
+    fail(`前置第 ${p.id} 节「${p.title}」还没掌握。确认要跳到这节的检验就加 --force yes`)
+  }
+  // 需复习的节上次的步骤都做完了：追加一步检验；别的节步骤都做完了就直接判
+  const allDone = l.steps.length && l.steps.every((x) => x.status === 'done')
+  if (allDone && l.status !== 'review') fail(`第 ${l.id} 节的步骤都做完了，直接 learn done ${l.id} --pass|--fail --note "…"`)
+  const extra = []
+  const other = s.lessons.find((x) => x.status === 'in_progress' && x.id !== l.id)
+  if (other) {
+    const k = other.steps.filter((x) => x.status === 'done').length
+    if (other.steps.length && k === other.steps.length) fail(`第 ${other.id} 节步骤都做完了还没检验：先 learn done ${other.id} --pass|--fail`)
+    other.status = 'todo'
+    if (k) extra.push(`第 ${other.id} 节做到第 ${k}/${other.steps.length} 步还没检验，已暂停；回来用 learn start ${other.id}（不带 --steps）接着做。`)
+  }
+  const reason = flags.reason ? String(flags.reason).slice(0, 80) : '用户说这节会了，直接检验'
+  const isCheck = (st) => /检验|考核/.test(st.title)
+  const last = l.steps[l.steps.length - 1]
+  for (const st of l.steps) {
+    if (st.status === 'done' || (st === last && isCheck(st))) continue
+    st.status = 'done'
+    st.result = `跳过：${reason}`
+  }
+  if (!last || !isCheck(last) || allDone) l.steps.push(...newSteps(['直接检验']))
+  for (const st of l.steps) if (st.status !== 'done') { st.status = 'in_progress'; break }
+  l.status = 'in_progress'
+  l.forced = unmet.length > 0
+  l.directCheck = true
+  saveState(name, s, `第 ${l.id} 节跳过讲解，直接检验：${reason}`)
+  extra.push(`已跳到检验。过了就算掌握（learn done ${l.id} --pass --note "…"）；没过（learn done ${l.id} --fail --note "…"）就告诉用户哪里没过，问要不要学这一节：要学就 learn start ${l.id} --steps '[…]' --force yes 重新拆步骤，不学就按 done 追加的补练步骤只补没过的那一项。`)
+  return `${extra.join('\n')}\n${positionLine(s)}`
+}
+
 commands.switch = ({ pos, flags }) => {
   const name = pickCourse(flags)
   const s = loadState(name)
@@ -2064,6 +2111,7 @@ commands.switch = ({ pos, flags }) => {
     const steps = parseSteps(flags.steps)
     const kept = l.steps.filter((x) => x.status === 'done')
     l.steps = [...kept, ...newSteps(steps)]
+    delete l.directCheck
   }
   saveState(name, s, `第 ${l.id} 节换教法：${METHOD_NAMES[from] || '无'} → ${METHOD_NAMES[m]}，原因：${reason}`)
   return `已换成${METHOD_NAMES[m]}。\n${positionLine(s)}`
@@ -2077,7 +2125,9 @@ commands.done = ({ pos, flags }) => {
   const note = need(flags.note, '--note（检验证据：做对了哪道题、费曼判分各项结果）')
   const remedy = flags.fail && flags.steps ? parseSteps(flags.steps) : null
   l.attempts += 1
-  l.notes.push({ at: isoLocal(), pass: !!flags.pass, note, method: l.method })
+  // 跳过讲解直接检验的这一次检验记在检验记录上：教法统计不算它（跟教法无关）
+  l.notes.push({ at: isoLocal(), pass: !!flags.pass, note, method: l.method, ...(l.directCheck ? { direct: true } : {}) })
+  delete l.directCheck
   let msg
   if (flags.pass) {
     l.status = 'mastered'
@@ -2106,7 +2156,7 @@ commands.done = ({ pos, flags }) => {
   let receipt = ''
   if (flags.pass && l.kind === 'prereq' && l.prereqSkill) {
     // 先修节只讲了本课要用的部分，所以记「会一点」
-    receipt = '\n' + profileWriteSafe((p) => addEvidence(p, { name: l.prereqSkill, type: 'lesson', level: 'partial', course: name, ref: `prereq-lesson-${l.id}`, detail: `先修节通过：${l.title}`.slice(0, MAX_DETAIL) }))
+    receipt = '\n' + relay(profileWriteSafe((p) => addEvidence(p, { name: l.prereqSkill, type: 'lesson', level: 'partial', course: name, ref: `prereq-lesson-${l.id}`, detail: `先修节通过：${l.title}`.slice(0, MAX_DETAIL) })))
   }
   return `${msg}${receipt}\n${positionLine(s)}`
 }
@@ -2440,29 +2490,54 @@ commands.prereq = ({ pos, flags }) => {
 
   if (sub === 'answer') {
     if (!s.prereq) fail('还没有先修清单，先 learn prereq set')
-    const it = prereqItem(s, need(pos[1], '技能名'))
-    const letter = String(need(pos[2], '选项 A|B|C|D')).toUpperCase()
-    if (!['A', 'B', 'C', 'D'].includes(letter)) fail('选项只能是 A（能独立做）/ B（会一点，要查资料）/ C（没接触过）/ D（不确定）')
-    if (it.state !== 'ask') fail(`「${it.name}」现在不需要问会不会：${prereqLine(it)}`)
-    const quote = flags.quote ? checkText(flags.quote, '--quote', { quote: true }) : null
-    it.answer = letter
-    s.prereq.asked += 1
-    const receipt = ANSWER_LEVEL[letter]
-      ? profileWriteSafe((p) => addEvidence(p, { name: it.name, type: 'self', level: ANSWER_LEVEL[letter], course: name, ref: `prereq-a${s.prereq.asked}`, detail: quote ? `「${quote}」` : `先修问答选 ${letter}${it.cue ? `（看到 ${it.cue} 问的）` : ''}` }))
-      : '画像：选了「不确定」，不记入。'
-    if (it.role === 'core') {
-      // 必需项不凭自述定成已会：都出验证题；分不到名额的由脚本转成问怎么补
-      if (letter === 'C') setDecide(it, 'learn-first')
-      else it.state = 'quiz'
-    } else if (it.role === 'general') {
-      if (letter === 'A' || letter === 'B') setDone(it, 'known')
-      else if (letter === 'C') setDecide(it, 'inline')
-      else setDone(it, 'inline')
-    } else if (letter === 'A' || letter === 'B') it.state = 'quiz'
-    else setDone(it, 'dropped')
+    // 一次提问问了几项：--json '[{"name":"Java","choice":"B","quote":"…"}]' 一起记，画像回执合成一行
+    const many = flags.json !== undefined || flags.file !== undefined
+    const list = many ? readJsonArg(flags) : [{ name: pos[1], choice: pos[2], quote: flags.quote }]
+    if (!Array.isArray(list) || !list.length) fail('--json 要是非空数组：[{"name":"Java","choice":"B","quote":"用户原话（可省略）"}]')
+    const rows = []
+    for (const x of list) {
+      const it = prereqItem(s, need(x?.name, many ? '每项的 name' : '技能名'))
+      const letter = String(need(x.choice, many ? `「${it.name}」的 choice（A|B|C|D）` : '选项 A|B|C|D')).toUpperCase()
+      if (!['A', 'B', 'C', 'D'].includes(letter)) fail(`${many ? `「${it.name}」的` : ''}选项只能是 A（能独立做）/ B（会一点，要查资料）/ C（没接触过）/ D（不确定）`)
+      if (rows.some((r) => r.it === it)) fail(`「${it.name}」写了两次`)
+      if (it.state !== 'ask') fail(`「${it.name}」现在不需要问会不会：${prereqLine(it)}`)
+      const quote = x.quote ? checkText(x.quote, many ? `「${it.name}」的 quote` : '--quote', { quote: true }) : null
+      rows.push({ it, letter, quote })
+    }
+    for (const r of rows) {
+      r.it.answer = r.letter
+      s.prereq.asked += 1
+      r.ref = `prereq-a${s.prereq.asked}`
+    }
+    const recs = rows.filter((r) => ANSWER_LEVEL[r.letter])
+    const unsure = rows.filter((r) => !ANSWER_LEVEL[r.letter]).map((r) => `「${r.it.name}」`)
+    const unsureText = unsure.length ? `${many ? unsure.join('、') : ''}选了「不确定」，不记入。` : ''
+    const receipt = !recs.length ? `画像：${unsureText}` : profileWriteSafe((p) => {
+      const wasEmpty = !p.skills.length
+      const add = (r) => addEvidence(p, { name: r.it.name, type: 'self', level: ANSWER_LEVEL[r.letter], course: name, ref: r.ref, detail: r.quote ? `「${r.quote}」` : `先修问答选 ${r.letter}${r.it.cue ? `（看到 ${r.it.cue} 问的）` : ''}` }, { brief: many })
+      if (!many) return add(recs[0])
+      // 一项写不进（如画像满了）不连累别的项；addEvidence 出错时还没改画像
+      const parts = [], failed = []
+      for (const r of recs) { try { parts.push(add(r)) } catch (e) { failed.push(`「${r.it.name}」没记入：${e.message}`) } }
+      return `${parts.length ? `画像：已记入 ${parts.join('；')}。` : '画像：'}${unsureText}${failed.length ? `⚠ ${failed.join('；')}。` : ''}${parts.length ? '哪条不对，说「删掉某某那条」就删。' : ''}`
+        + (wasEmpty && parts.length ? `\n画像存在 ${PROFILE}，只记学习相关的技能；查看：learn profile` : '')
+    })
+    for (const { it, letter } of rows) {
+      if (it.role === 'core') {
+        // 必需项不凭自述定成已会：都出验证题；分不到名额的由脚本转成问怎么补
+        if (letter === 'C') setDecide(it, 'learn-first')
+        else it.state = 'quiz'
+      } else if (it.role === 'general') {
+        if (letter === 'A' || letter === 'B') setDone(it, 'known')
+        else if (letter === 'C') setDecide(it, 'inline')
+        else setDone(it, 'inline')
+      } else if (letter === 'A' || letter === 'B') it.state = 'quiz'
+      else setDone(it, 'dropped')
+    }
     const report = prereqReport(s)
-    saveState(name, s, `先修「${it.name}」：选 ${letter}`)
-    return `${receipt}\n${report}`
+    saveState(name, s, `先修${rows.map((r) => `「${r.it.name}」：选 ${r.letter}`).join('，')}`)
+    // 画像回执放最后：最不容易被截掉
+    return `${report}\n${relay(receipt)}`
   }
 
   if (sub === 'quiz') {
@@ -2483,19 +2558,16 @@ commands.prereq = ({ pos, flags }) => {
     else setDecide(it, it.role === 'core' ? 'learn-first' : 'inline')
     const report = prereqReport(s)
     saveState(name, s, `先修「${it.name}」验证题：${level}`)
-    return `${receipt}\n${report}`
+    return `${report}\n${relay(receipt)}`
   }
 
   if (sub === 'decide') {
     if (!s.prereq) fail('还没有先修清单，先 learn prereq set')
     const changed = []
-    if (flags['all-recommended']) {
-      const dec = s.prereq.items.filter((x) => x.state === 'decide')
-      if (!dec.length) fail('没有待定怎么补的先修')
-      for (const x of dec) { setDone(x, x.recommend); changed.push(x) }
-    } else {
-      const it = prereqItem(s, need(pos[1], '技能名'))
-      const d = need(pos[2], '决定 learn-first|inline|separate|skip')
+    const decideOne = (x, many) => {
+      const it = prereqItem(s, need(x?.name, many ? '每项的 name' : '技能名'))
+      if (changed.includes(it)) fail(`「${it.name}」写了两次`)
+      const d = need(x.decision, many ? `「${it.name}」的 decision` : '决定 learn-first|inline|separate|skip')
       // 名额用完、没验证就不拿来打比方的可类比项：用户坚持说会、验证过了，可以改回拿来打比方
       const droppedRelated = it.role === 'related' && it.state === 'done' && it.decision === 'dropped' && !it.quizLevel && /名额用完/.test(it.note || '')
       if (d === 'known') {
@@ -2511,9 +2583,20 @@ commands.prereq = ({ pos, flags }) => {
       // 问怎么补时选定的（包括后来改成已会的）都可以改
       if (!(d === 'known' && droppedRelated) && !(it.state === 'decide' || (it.state === 'done' && (DECISIONS.includes(it.decision) || (it.decision === 'known' && it.recommend))))) fail(`「${it.name}」不需要决定怎么补：${prereqLine(it)}`)
       setDone(it, d === 'known' && droppedRelated ? 'anchor' : d)
-      if (flags.note) it.note = String(flags.note).slice(0, 80)
+      if (x.note) it.note = String(x.note).slice(0, 80)
       else if (d === 'known') it.note = '后来验证过会了' // 原来的「名额用完没验证」不再成立
       changed.push(it)
+    }
+    if (flags['all-recommended']) {
+      const dec = s.prereq.items.filter((x) => x.state === 'decide')
+      if (!dec.length) fail('没有待定怎么补的先修')
+      for (const x of dec) { setDone(x, x.recommend); changed.push(x) }
+    } else {
+      // 几项选得不一样：--json '[{"name":"Java","decision":"inline"}]' 一起记；中途有一项不合法就整批不记
+      const many = flags.json !== undefined || flags.file !== undefined
+      const list = many ? readJsonArg(flags) : [{ name: pos[1], decision: pos[2], note: flags.note }]
+      if (!Array.isArray(list) || !list.length) fail('--json 要是非空数组：[{"name":"Java","decision":"learn-first|inline|separate|skip"}]')
+      for (const x of list) decideOne(x, many)
     }
     const hints = []
     for (const x of changed) {
@@ -2548,7 +2631,7 @@ commands.prereq = ({ pos, flags }) => {
     return `先用用户会的技能把「${it.name}」本节要用的最小部分讲清（不超过 3 轮），再问要不要正式补（用户已经卡在这里，不再问会不会）。${lid ? `已记到第 ${lid} 节的 uses。` : ''}\n${report}`
   }
 
-  fail('用法：learn prereq [show] | set --json \'[…]\' [--append] | set --none "<理由>" | answer <技能> <A|B|C|D> [--quote "…"] | quiz <技能> <档> --detail "…" | decide <技能> <决定> | decide --all-recommended | gap <技能> --reason "…" [--lesson <节>]')
+  fail('用法：learn prereq [show] | set --json \'[…]\' [--append] | set --none "<理由>" | answer <技能> <A|B|C|D> [--quote "…"] | answer --json \'[…]\' | quiz <技能> <档> --detail "…" | decide <技能> <决定> | decide --json \'[…]\' | decide --all-recommended | gap <技能> --reason "…" [--lesson <节>]')
 }
 
 // ---------- 画像命令 ----------
@@ -2827,8 +2910,10 @@ commands.help = () => `learn —— 学习进度脚本（数据目录：${HOME}�
        prereq set --json '[{"name":"Java","role":"core|general|related","reason":"本课用它做什么","cue":"pom.xml"}]' [--append]
        prereq set --none "<理由>"               这门课用不到别的技能
        prereq answer <技能> <A|B|C|D> [--quote "<用户原话>"]
+       prereq answer --json '[{"name":"Java","choice":"B","quote":"<用户原话，可省略>"}]'   一次问了几项，一起记
        prereq quiz <技能> <mastered|partial|none> --detail "<题目要点和回答>"
        prereq decide <技能> <learn-first|inline|separate|skip> | prereq decide --all-recommended
+       prereq decide --json '[{"name":"Java","decision":"inline"}]'   几项选得不一样，一起记
        prereq decide <技能> known               待定怎么补或「先单独学一门」的项：画像里已验证会了，改成已会
        prereq gap <技能> --reason "…" [--lesson <节>]   课中发现缺本课以外的技能
        prereq                                   看清单和下一步
@@ -2837,6 +2922,7 @@ commands.help = () => `learn —— 学习进度脚本（数据目录：${HOME}�
        plan                                     输出当前完整路线（调整计划时在它上面改）
 小节   start <节> --method <教法> --criteria "<达标标准>" --check "<检验方式>" --steps '["…","…"]' [--reason "…"]
        step <节> <步> --result "<结果>"         这一步做完了（默认）；只做了一半加 --partial
+       check <节> [--reason "…"]                用户说这节会了、想跳过：讲解和练习记成跳过，直接到检验
        switch <节> <教法> "<原因>" [--steps '[…]']
        done <节> --pass|--fail --note "<检验证据>" [--steps '["补…","费曼检验"]']   没过时追加补练步骤（不给就追加默认两步）
 疑问   ask "<原话>" [--lesson <节>] | answer <qid> "<结论>"
