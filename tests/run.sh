@@ -855,9 +855,16 @@ L start 1 --method first-principles --criteria c --steps '["暴露假设","基�
 o=$(L status); hasnt "摸底（细化这节" "$o"
 o=$(L switch 1 worked-example "从没接触过，先讲"); has "加载 skill teach-worked-example，按它的做法接着教。" "$o"; has "剩下的 4 步是按第一性原理拆的（「暴露假设」「基本事实」「一步步推」「费曼检验」）" "$o"; has "learn switch 1 worked-example \"<原因>\" --steps" "$o"
 o=$(L switch 1 worked-example "重拆" --steps '["示范","补全题","独立题","费曼检验"]'); hasnt "剩下的" "$o"; has "第 1/4 步：示范 · 下一步：补全题" "$o"
+o=$(L step 1 1 --result r); has "（给教练看，不用转告）这一步如果要用到没讲过的东西" "$o"; has "📍 第 1 节「数组」 · 第 2/4 步：补全题" "$o"
+o=$(L step 1 2 --partial --result r); hasnt "给教练看" "$o"
+o=$(L step 1 2 --result r); has "给教练看" "$o"
+o=$(L step 1 3 --result r); hasnt "给教练看" "$o"; has "第 4/4 步：费曼检验" "$o"
 o=$(J np 's.lessons[0].methodHistory.join(",")'); [ "$o" = '"first-principles,worked-example"' ] && ok || bad "同一教法再 switch 不该重复记进教法历史" "$o"
 o=$(L switch 2 coach "还没开讲"); has "开讲这节时 learn start 2，再加载 skill teach-coach。" "$o"; hasnt "按它的做法接着教" "$o"
-for i in 1 2 3 4; do L step 1 $i --result r >/dev/null; done
+o=$(L start 2 --method coach --criteria c --steps '["讲","练","费曼检验"]' --force yes); hasnt "给教练看" "$o"
+o=$(L step 2 1 --result r); hasnt "给教练看" "$o"
+o=$(L start 1 --force yes); hasnt "给教练看" "$o"; has "第 4/4 步：费曼检验" "$o"
+L step 1 4 --result r >/dev/null
 o=$(L switch 1 coach "做完了再换"); has "步骤都做完了：先 learn done 1" "$o"; hasnt "按它的做法接着教" "$o"
 L done 1 --pass --note ok >/dev/null; L review --lesson 1 --reason "忘了" >/dev/null
 o=$(L status); hasnt "摸底（细化这节" "$o"

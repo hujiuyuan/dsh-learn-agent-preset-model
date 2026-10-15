@@ -2021,6 +2021,8 @@ commands.start = ({ pos, flags }) => {
   }
   const anchors = anchorsOf(s, loadProfile())
   if (anchors.length && l.kind !== 'prereq') extra.push(bridgeGuide(anchors.map((a) => a.name)))
+  const tip = teachFirstTip(l)
+  if (tip) extra.push(tip)
   return `已开始。\n${extra.join('\n')}\n${positionLine(s)}`
 }
 
@@ -2033,6 +2035,15 @@ function parseSteps(raw) {
   return steps
 }
 const newSteps = (titles) => titles.map((t, i) => ({ title: t, status: i === 0 ? 'in_progress' : 'todo', result: null }))
+
+// 示范例题的节：进入讲解或练习的一步时提醒先讲后问（检验那一步不提醒）
+const TEACH_FIRST = '（给教练看，不用转告）这一步如果要用到没讲过的东西（新函数、新写法、新规则，或讲过的东西的新情况）：这一轮只讲，先具体例子，再用 bash 跑出来的完整代码和输出，最后讲规律；讲完只问看懂没有，不出题。用户说看懂了，下一轮再出题，题目只考讲过的。'
+function teachFirstTip(l) {
+  if (l.method !== 'worked-example' || l.status !== 'in_progress') return null
+  const i = l.steps.findIndex((x) => x.status !== 'done')
+  if (i < 0 || i === l.steps.length - 1) return null
+  return TEACH_FIRST
+}
 
 commands.step = ({ pos, flags }) => {
   const name = pickCourse(flags)
@@ -2053,7 +2064,8 @@ commands.step = ({ pos, flags }) => {
     if (nx && !l.steps.some((x) => x.status === 'in_progress')) nx.status = 'in_progress'
   }
   saveState(name, s, `第 ${l.id} 节第 ${n} 步「${st.title}」${status === 'done' ? '完成' : '进行到一半'}：${flags.result}`)
-  return positionLine(s)
+  const tip = status === 'done' ? teachFirstTip(l) : null
+  return `${tip ? `${tip}\n` : ''}${positionLine(s)}`
 }
 
 // 用户说这节会了、想跳过：讲解和练习的步骤记成「跳过」，位置条直接指到检验
