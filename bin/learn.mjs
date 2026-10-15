@@ -7,7 +7,9 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { randomBytes } from 'node:crypto'
 
 const VERSION = 1
 const INTERVALS = [1, 3, 7, 14] // 错题复习间隔（天），按 stage 取；通过 stage 4 后移出错题本
@@ -45,7 +47,7 @@ const ALIAS_GROUPS = [
 ]
 
 // 先修问答
-const PREREQ_BUDGET = 4 // 「会不会」和验证题合计最多问这么多（决定怎么补的那一问不算）
+const PREREQ_BUDGET = 4 // 每批最多出这么多道验证题（问会不会、问怎么补都不算）
 const ROLES = ['core', 'general', 'related']
 const ROLE_NAMES = { core: '必需', general: '有帮助', related: '可类比' }
 const ROLE_CAPS = { core: 3, general: 2, related: 2 }
@@ -69,8 +71,16 @@ const GLOBAL_SKILLS = path.join(path.dirname(HOME), 'learn-skills')
 const PROFILE = path.join(HOME, 'profile.json')
 const PROFILE_BAK = `${PROFILE}.bak`
 const PROFILE_LOCK = `${PROFILE}.lock`
-// 画像不进 git：清空画像要能真的清空
-const GITIGNORE_LINES = ['*.tmp', '.current', 'profile.json', 'profile.json.bak', 'profile.json.lock']
+const SELF = fileURLToPath(import.meta.url)
+const SYNC_FILE = path.join(HOME, '.sync.json') // 这台电脑的同步状态（不进 git）
+const SYNC_LOCK = path.join(HOME, '.sync.lock')
+const DATA_LOCK = path.join(HOME, '.learn.lock') // 每条命令读写数据目录时都拿着它
+const MERGE_MARK = path.join(HOME, '.git', 'learn-merge-pending.json') // 合并做到一半的记号：{ head, commit }
+// 画像默认不进 git：清空画像要能真的清空；连了同步仓库才进 git，跟进度一起同步
+// 系统自己生成的文件（访达的 .DS_Store、Windows 的 Thumbs.db 等）也不进 git，免得打开过课程文件夹就算改了这门课
+const OS_JUNK = ['.DS_Store', '._*', 'Thumbs.db', 'desktop.ini']
+const isJunk = (p) => /(^|\/)(\.DS_Store|\._[^/]*|Thumbs\.db|desktop\.ini)$/i.test(p)
+const GITIGNORE_BASE = ['*.tmp', '.current', 'profile.json.bak', 'profile.json.lock', '.sync.json', '.sync.lock', '.local.json', '.learn.lock', ...OS_JUNK]
 
 function now() { return new Date() }
 
@@ -104,7 +114,7 @@ function shortTime(iso) { return iso ? iso.slice(5, 16).replace('T', ' ') : '' }
 function readJson(file) { return JSON.parse(fs.readFileSync(file, 'utf8')) }
 
 function writeJson(file, data) {
-  const tmp = `${file}.tmp`
+  const tmp = `${file}.${process.pid}.tmp` // 后台推送和前台命令可能同时写同一个文件
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n')
   fs.renameSync(tmp, file)
 }
@@ -173,17 +183,25 @@ function ensureHome() {
   if (!fs.existsSync(HOME)) fs.mkdirSync(HOME, { recursive: true })
   if (!fs.existsSync(path.join(HOME, '.git')) && git(['--version']) !== null) git(['init', '-q'])
   const gi = path.join(HOME, '.gitignore')
-  const have = fs.existsSync(gi) ? fs.readFileSync(gi, 'utf8').split(/\r?\n/) : []
-  const missing = GITIGNORE_LINES.filter((x) => !have.includes(x))
-  if (missing.length) fs.appendFileSync(gi, (have.length && have[have.length - 1] !== '' ? '\n' : '') + missing.join('\n') + '\n')
+  const have = fs.existsSync(gi) ? fs.readFileSync(gi, 'utf8').split(/\r?\n/).filter((x) => x !== '') : []
+  const synced = !!hasRemote()
+  const want = synced ? GITIGNORE_BASE : [...GITIGNORE_BASE, 'profile.json']
+  const next = [...have.filter((x) => x !== 'profile.json' || want.includes(x)), ...want.filter((x) => !have.includes(x))]
+  if (!fs.existsSync(gi) || next.join('\n') !== have.join('\n')) fs.writeFileSync(gi, next.join('\n') + '\n')
+  const junk = (git(['ls-files', '-z']) || '').split('\0').filter((x) => x && isJunk(x))
+  if (junk.length) git(['rm', '-q', '--cached', '--ignore-unmatch', '--', ...junk])
   if (!fs.existsSync(INDEX)) writeJson(INDEX, { version: VERSION, current: null, courses: {} })
-  const cur = loadIndex().current
-  if (cur && !fs.existsSync(path.join(HOME, '.current'))) setCurrentLink(cur)
+  relinkCurrent()
 }
 
+// 当前课程以这台电脑自己记的为准（见 .local.json）
 function loadIndex() {
   if (!fs.existsSync(INDEX)) return { version: VERSION, current: null, courses: {} }
-  return readJson(INDEX)
+  const idx = readJson(INDEX)
+  for (const k of Object.keys(idx.courses || {})) if (!fs.existsSync(courseDir(k))) delete idx.courses[k] // 课程目录已经不在了
+  const cur = loadLocal().current
+  if (cur && idx.courses?.[cur] && fs.existsSync(stateFile(cur))) idx.current = cur
+  return idx
 }
 
 function courseDir(name) { return path.join(HOME, name) }
@@ -211,8 +229,18 @@ function validateState(s) {
   return errs
 }
 
-// 读状态；坏了就从 git 最近一次提交恢复
+// 读状态：旧档案补上批号；分不到验证题名额的先修项当场定掉（结果是确定的，各命令看到的一致）
 function loadState(name) {
+  const s = readState(name)
+  if (s.prereq) {
+    migratePrereq(s.prereq)
+    settleQuizzes(s)
+  }
+  return s
+}
+
+// 读 state.json；坏了就从 git 最近一次提交恢复
+function readState(name) {
   const file = stateFile(name)
   let s, errs
   try { s = readJson(file); errs = validateState(s) } catch (e) { errs = [e.message] }
@@ -241,12 +269,11 @@ function saveState(name, s, logLine, { session = true } = {}) {
   const idx = loadIndex()
   if (idx.courses[name]) idx.courses[name].lastActive = s.updatedAt
   idx.current = name
-  writeJson(INDEX, idx)
+  saveIndex(idx)
   if (logLine) {
     fs.appendFileSync(path.join(courseDir(name), 'log.md'), `- ${shortTime(s.updatedAt)} ${logLine}\n`)
   }
-  git(['add', '-A'])
-  git(['commit', '-q', '-m', `${name}: ${logLine || '更新'}`])
+  commitAll(`${name}: ${logLine || '更新'}`)
 }
 
 // 改别的课程（不切换当前课程、不算一次学习）
@@ -254,8 +281,7 @@ function saveOtherState(name, s, logLine) {
   s.updatedAt = isoLocal()
   writeJson(stateFile(name), s)
   fs.appendFileSync(path.join(courseDir(name), 'log.md'), `- ${shortTime(s.updatedAt)} ${logLine}\n`)
-  git(['add', '-A'])
-  git(['commit', '-q', '-m', `${name}: ${logLine}`])
+  commitAll(`${name}: ${logLine}`)
 }
 
 function setCurrentLink(name) {
@@ -263,6 +289,822 @@ function setCurrentLink(name) {
   try { fs.rmSync(link, { force: true, recursive: false }) } catch {}
   try { fs.unlinkSync(link) } catch {}
   try { fs.symlinkSync(courseDir(name), link, process.platform === 'win32' ? 'junction' : 'dir') } catch {}
+}
+
+// 当前课程按电脑各自记在 .local.json（不进 git）：两台电脑可以各学各的，同步不会互相换掉。
+// index.json 里的 current 只给第一次拉到这份记录的电脑当初始值
+const LOCAL_FILE = path.join(HOME, '.local.json')
+function loadLocal() { try { const v = readJson(LOCAL_FILE); return v && typeof v === 'object' && !Array.isArray(v) ? v : {} } catch { return {} } }
+function setLocalCurrent(name) {
+  const l = loadLocal()
+  if (name && l.current !== name) writeJson(LOCAL_FILE, { ...l, current: name })
+}
+
+function saveIndex(idx) {
+  writeJson(INDEX, idx)
+  setLocalCurrent(idx.current)
+}
+
+// .current 跟着这台电脑的当前课程走
+function relinkCurrent() {
+  const cur = loadIndex().current
+  if (!cur || !fs.existsSync(courseDir(cur))) return
+  let have = null
+  try { have = fs.readlinkSync(path.join(HOME, '.current')).replace(/^\\\\\?\\/, '') } catch {}
+  if (!have || path.resolve(HOME, have) !== path.resolve(courseDir(cur))) setCurrentLink(cur)
+}
+
+let committed = false // 这次运行有没有产生新提交（有就推到同步仓库）
+let commitError = null
+
+// 学习记录的 git 操作不用用户全局配的钩子（钩子目录指向一个不存在的目录）
+const noHooks = () => ['-c', `core.hooksPath=${path.join(HOME, '.git', 'learn-no-hooks')}`]
+
+// 学习记录的提交：不签名、不跑钩子（用户全局开了签名或钩子也不会卡住）；
+// 这台电脑的 git 没配用户名和邮箱时用固定署名，免得提交失败
+let identCache
+function idArgs() {
+  if (identCache === undefined) {
+    const ident = git(['var', 'GIT_AUTHOR_IDENT']) !== null && git(['var', 'GIT_COMMITTER_IDENT']) !== null
+      ? [] : ['-c', 'user.name=learn', '-c', 'user.email=learn@localhost']
+    identCache = ['-c', 'commit.gpgsign=false', ...noHooks(), ...ident]
+  }
+  return identCache
+}
+
+function commitAll(msg) {
+  if (!fs.existsSync(path.join(HOME, '.git'))) return
+  let r = gitRun(['add', '-A'])
+  if (r.ok) {
+    if (git(['diff', '--cached', '--quiet']) !== null) return // 没有改动
+    r = gitRun([...idArgs(), 'commit', '-q', '-m', msg])
+  }
+  if (r.ok) { committed = true; return }
+  if (!commitError) warnings.push(`进度已经存到文件里，但没能提交进 git（${r.err}）`)
+  commitError = r.err
+}
+
+// ---------- 多台电脑同步 ----------
+// 用 git 远程仓库（建议 GitHub 私有库）同步整个数据目录，画像也在内。
+// 只有 learn sync --remote 连成功后才算开了同步（记在 .sync.json），数据目录里原来就有的 origin 不算。
+// 拉：status 每次都拉；其他命令距上次尝试超过 5 分钟（上次没连上就 30 分钟）、或上次推送被拒时才拉。
+// 推：有新提交就在后台推；收尾（pause / finish）当场推，并告诉用户推没推上去。
+// 合并：不重放历史，按「分叉点 / 这台 / 仓库」三份内容逐门课地合，生成一个合并提交（见 planMerge）。
+// 同一门课两边都改了合不了，交给用户选这门课留哪边，其余课程和画像照常合上。
+// 每条命令都在数据目录锁里跑（见 main），合并时不会有别的 learn 进程同时写。
+const PULL_EVERY_MIN = 5 // 上次没连上时放宽到 30 分钟，免得断网时每条命令都等
+const syncNotes = [] // 同步提示：status 放在最前面，其他命令放在最后
+let syncCache
+
+const asObject = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {})
+function loadSync() { try { return asObject(readJson(SYNC_FILE)) } catch { return {} } }
+function updateSync(patch) { const st = { ...loadSync(), ...patch }; writeJson(SYNC_FILE, st); return st }
+
+// 开了同步返回 { url, branch }；没开、或 origin 被改成了别的地址，返回 null
+function syncConf() {
+  if (syncCache === undefined) {
+    const st = loadSync()
+    const url = st.enabled && fs.existsSync(path.join(HOME, '.git')) ? (git(['config', '--get', 'remote.origin.url']) || '').trim() : ''
+    syncCache = st.enabled && st.url && st.branch && url === st.url ? { url: st.url, branch: st.branch } : null
+  }
+  return syncCache
+}
+const hasRemote = () => syncConf()?.url || null
+
+// 开了同步时，画像里新的 id 带上这台电脑的 3 个字母（如 e12kqx），两台电脑各记各的也不会撞号，合并时不用改号
+function idTag() {
+  if (!hasRemote()) return ''
+  const l = loadLocal()
+  if (/^[a-z]{3}$/.test(l.machine || '')) return l.machine
+  const machine = [...randomBytes(3)].map((b) => String.fromCharCode(97 + (b % 26))).join('')
+  writeJson(LOCAL_FILE, { ...l, machine })
+  return machine
+}
+
+// 显示用：去掉 http(s) 地址里可能带的用户名和 token（ssh 地址里的 git@ 是登录名，要留着）
+function safeUrl(url) { return String(url).replace(/^(https?:\/\/)[^/@]*@/i, '$1') }
+
+// 联网的 git 命令：不弹密码提示，SSH 不等交互
+function netEnv() {
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' }
+  if (!env.GIT_SSH_COMMAND && !env.GIT_SSH && !git(['config', '--get', 'core.sshCommand'])) env.GIT_SSH_COMMAND = 'ssh -o BatchMode=yes -o ConnectTimeout=10'
+  return env
+}
+
+// git 的报错只留最有用的一行：先找能说明原因的（仓库拒收、仓库不存在、没权限、连不上），再找 fatal / error
+const ERR_CAUSE = /\[remote rejected\]|repository not found|permission denied|access denied|authentication failed|host key verification failed|could not resolve host|connection (refused|timed out)|unpack failed|protected branch|does not appear to be a git repository|\b403\b/i
+function gitErr(text) {
+  const lines = String(text || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
+  const remote = lines.filter((x) => /^remote:\s*\S/.test(x) && !/^remote:\s*(Enumerating|Counting|Compressing|Total|Resolving|Create a pull request|To create a merge request|https?:\/\/)/i.test(x))
+  return (lines.find((x) => ERR_CAUSE.test(x)) || remote.find((x) => /error|fatal|denied|declined|reject/i.test(x)) || lines.find((x) => /^ERROR:/.test(x))
+    || lines.find((x) => /^fatal:/.test(x)) || lines.find((x) => /^error:/.test(x)) || remote[0] || lines[0] || '原因不明').slice(0, 160)
+}
+
+function gitRun(args, { timeout, net = false, env = null, input } = {}) {
+  const base = net ? netEnv() : process.env
+  const r = spawnSync('git', args, { cwd: HOME, encoding: 'utf8', timeout, input, env: env ? { ...base, ...env } : base, windowsHide: true, maxBuffer: 256 * 1024 * 1024 })
+  const raw = r.error ? (r.error.code === 'ETIMEDOUT' ? `超时（${Math.round(timeout / 1000)} 秒）` : r.error.message) : `${r.stderr || ''}\n${r.stdout || ''}`
+  return { ok: !r.error && r.status === 0, out: (r.stdout || '').trim(), stdout: r.stdout || '', raw, err: gitErr(raw) }
+}
+
+function currentBranch() { return (git(['symbolic-ref', '--short', '-q', 'HEAD']) || '').trim() || null }
+function refExists(ref) { return git(['rev-parse', '-q', '--verify', `${ref}^{commit}`]) !== null }
+const revOf = (ref) => (git(['rev-parse', '-q', '--verify', `${ref}^{commit}`]) || '').trim() || null
+const hasCommits = () => refExists('HEAD')
+const rebaseInProgress = () => ['rebase-merge', 'rebase-apply'].some((d) => fs.existsSync(path.join(HOME, '.git', d)))
+
+// 进程被强行杀掉时 git 留下的锁文件：超过 2 分钟（比任何一次 git 操作的超时都长）还在，就是没人用的，删掉
+function clearStaleGitLocks() {
+  const g = path.join(HOME, '.git')
+  if (!fs.existsSync(g)) return
+  const files = ['index.lock', 'HEAD.lock', 'packed-refs.lock', 'config.lock', 'shallow.lock'].map((x) => path.join(g, x))
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name)
+      if (e.isDirectory()) walk(p)
+      else if (e.name.endsWith('.lock')) files.push(p)
+    }
+  }
+  try { walk(path.join(g, 'refs')) } catch {}
+  try { for (const x of fs.readdirSync(g)) if (/^learn-merge-\d+\.index/.test(x)) files.push(path.join(g, x)) } catch {}
+  for (const f of files) {
+    try { if (Date.now() - fs.statSync(f).mtimeMs > 120000) fs.rmSync(f, { force: true }) } catch {}
+  }
+}
+
+// 本脚本不再用 rebase 合并；数据目录停在 rebase 中间（旧版脚本或手动 git 留下的）就退回去，退不回去就不往下写
+function recoverRebase() {
+  if (!rebaseInProgress()) return
+  git(['rebase', '--abort'])
+  if (rebaseInProgress()) git(['rebase', '--quit'])
+  if (rebaseInProgress()) fail(`学习记录停在 git 合并到一半的状态，自动退回失败，这次没有记录。把这句话告诉用户：需要在 ${HOME} 里手动处理（git status 查看）。`)
+  warnings.push('学习记录之前停在 git 合并到一半的状态，已退回合并前的样子。')
+}
+
+// 这台比同步仓库多几条、少几条记录
+function aheadBehind(rref) {
+  const out = git(['rev-list', '--left-right', '--count', `HEAD...${rref}`])
+  if (!out) return null
+  const [ahead, behind] = out.trim().split(/\s+/).map(Number)
+  return { ahead, behind }
+}
+
+// 要不要推：null 不用推；{ push: true } 要推；{ why } 推不了及原因
+function pushState() {
+  const conf = syncConf()
+  if (!conf || !hasCommits()) return null
+  if (rebaseInProgress() || !currentBranch()) return { why: '学习记录不在正常的分支上（可能是 git 操作被打断），先运行 learn sync 看情况' }
+  if ((git(['--no-optional-locks', 'status', '--porcelain', '--ignore-submodules=dirty']) || '').trim()) return { why: `有改动没能提交进 git${commitError ? `（${commitError}）` : ''}` }
+  const rref = `origin/${conf.branch}`
+  if (!refExists(rref)) return { push: true }
+  return (aheadBehind(rref)?.ahead || 0) > 0 ? { push: true } : null
+}
+const needsPush = () => pushState()?.push === true
+
+function courseLabel(name) {
+  const c = loadIndex().courses?.[name]
+  return c?.title ? `「${c.title}」（${name}）` : name
+}
+
+function sideSummary(range, dir) {
+  const only = dir ? ['--', `${dir}`] : []
+  const count = Number((git(['rev-list', '--count', range, ...only]) || '0').trim())
+  const recent = (git(['log', '--format=%s', '-n', '3', range, ...only]) || '').split('\n').filter(Boolean)
+    .map((x) => x.replace(/^[a-z0-9][a-z0-9-]*: /, '').slice(0, 40))
+  return { count, recent }
+}
+
+function describeConflict(rref, names) {
+  return { at: isoLocal(), courses: names.map((name) => ({ name, local: sideSummary(`${rref}..HEAD`, name), remote: sideSummary(`HEAD..${rref}`, name) })) }
+}
+
+function conflictText(c) {
+  const side = (x) => `${x.count} 条${x.recent.length ? `（最近：${x.recent.join(' | ')}）` : ''}`
+  const names = (c.courses || []).map((x) => courseLabel(x.name)).join('、')
+  return `⚠ 同步冲突：${names} 在这台电脑和同步仓库里都记了新内容，合不到一起。其他课程和画像不用选，选完一起合并；选之前，这台看不到仓库里的新记录，这台新记的也推不上去。\n`
+    + (c.courses || []).map((x) => `  ${courseLabel(x.name)}：这台多出 ${side(x.local)}；仓库多出 ${side(x.remote)}`).join('\n')
+    + '\n先把两边各记了什么告诉用户，问留哪边；选完再继续学：\n'
+    + `  learn sync --keep remote：${names} 用仓库里的，这台多出的那些存进备份分支，不会丢\n`
+    + `  learn sync --keep local：${names} 用这台的，仓库里多出的那些存进备份分支，不会丢`
+}
+
+const isTransient = (raw) => /cannot lock ref|unable to create '.*\.lock'|index\.lock/i.test(raw)
+
+function fetchOrigin(timeout = 15000) {
+  const run = () => gitRun(['fetch', '-q', '--prune', 'origin'], { timeout, net: true })
+  let f = run()
+  if (!f.ok && isTransient(f.raw)) { sleepMs(500); f = run() }
+  return f
+}
+
+// ---- 按内容合并 index.json 和 profile.json ----
+// ours 是仓库那边，theirs 是这台
+
+// 课程列表：两边的课程都留，同一门课取最近活动的那份；当前课程跟这台走
+function mergeIndex(base, ours, theirs) {
+  if (ours === null || theirs === null) return null
+  if (!ours || !theirs) return ours || theirs || null
+  const out = { ...ours, courses: { ...(ours.courses || {}) } }
+  for (const [k, v] of Object.entries(theirs.courses || {})) {
+    const o = out.courses[k]
+    if (!o || String(v.lastActive || '') > String(o.lastActive || '')) out.courses[k] = v
+  }
+  out.current = theirs.current || ours.current
+  return out
+}
+
+const evKey = (e) => [e.type, e.level, e.at, e.course, e.ref, e.detail].join('\u0001')
+
+// 证据的先后：日期 → 记录时刻 ts（UTC，旧数据没有，算最早）→ 编号 → id。
+// 不靠数组顺序，也不只靠编号（两台电脑各自从同一个编号往下记），在哪台电脑上合并结果都一样
+const evOrder = (a, b) => a.at.localeCompare(b.at) || (a.ts || '').localeCompare(b.ts || '')
+  || parseInt(a.id.slice(1), 10) - parseInt(b.id.slice(1), 10) || a.id.localeCompare(b.id)
+
+// 每个技能最多留 MAX_EVIDENCE 条：先丢最旧的自述，再丢最旧的非结业证据；keep 里的（两边新记的）不丢，裁不下就多留
+function trimEvidence(sk, keep = new Set()) {
+  sk.evidence.sort(evOrder)
+  while (sk.evidence.length > MAX_EVIDENCE) {
+    const pick = (f) => sk.evidence.findIndex((x) => !keep.has(evKey(x)) && f(x))
+    let i = pick((x) => x.type === 'self')
+    if (i < 0) i = pick((x) => x.type !== 'course')
+    if (i < 0) break
+    sk.evidence.splice(i, 1)
+  }
+}
+
+// 画像三方合并（基线是两边的分叉点）：两边新加的证据都留；基线里有、任一边删掉的去掉；技能剩不下证据才删。
+// 以这台为底；开了同步后新记的 id 带电脑标记，一般撞不上。两边同一个编号记的是不同的证据（开同步前各自记的）：
+// 两条都换新号，旧号作废（按旧号删会被拒、列出现在的编号），不会删错。
+// 暂停：只有一边改了就听那边的，两边都改了以暂停为准
+function mergeProfile(base, ours, theirs) {
+  if (base === null || ours === null || theirs === null) return null
+  const blank = () => ({ ...emptyProfile(), enabled: base ? base.enabled !== false : true })
+  ours = ours ?? blank()
+  theirs = theirs ?? blank()
+  if (!validProfile(ours) || !validProfile(theirs) || (base && !validProfile(base))) return null
+  const key = (sk) => canonKey(sk.name)
+  const bSk = new Map((base?.skills || []).map((sk) => [key(sk), sk]))
+  const oSk = new Map(ours.skills.map((sk) => [key(sk), sk]))
+  const tSk = new Map(theirs.skills.map((sk) => [key(sk), sk]))
+  const seq = { s: Math.max(ours.seq.s, theirs.seq.s), e: Math.max(ours.seq.e, theirs.seq.e), v: Math.max(ours.seq.v || 0, theirs.seq.v || 0) }
+  const usedS = new Set(theirs.skills.map((sk) => sk.id))
+  const newId = (used, k) => {
+    let n
+    do { seq[k] += 1; n = `${k}${seq[k]}${idTag()}` } while (used.has(n))
+    used.add(n)
+    return n
+  }
+  const fresh = (used, id, k) => {
+    if (!used.has(id)) { used.add(id); return id }
+    return newId(used, k)
+  }
+  const allEv = (p) => p.skills.flatMap((sk) => sk.evidence)
+  const tKey = new Map(allEv(theirs).map((e) => [e.id, evKey(e)]))
+  const clash = new Set(allEv(ours).filter((e) => tKey.has(e.id) && tKey.get(e.id) !== evKey(e)).map((e) => e.id))
+  const usedE = new Set([...tKey.keys(), ...allEv(ours).map((e) => e.id)])
+  const eid = (e) => (clash.has(e.id) ? newId(usedE, 'e') : e.id)
+  const skills = []
+  for (const k of new Set([...tSk.keys(), ...oSk.keys()])) {
+    const b = bSk.get(k)
+    const o = oSk.get(k)
+    const t = tSk.get(k)
+    const bEv = new Set((b?.evidence || []).map(evKey))
+    const oEv = new Set((o?.evidence || []).map(evKey))
+    const tEv = new Set((t?.evidence || []).map(evKey))
+    const seen = new Set()
+    const evs = []
+    for (const e of t?.evidence || []) {
+      if ((bEv.has(evKey(e)) && !oEv.has(evKey(e))) || seen.has(evKey(e))) continue // 仓库那边删了
+      seen.add(evKey(e))
+      evs.push({ ...e, id: eid(e) })
+    }
+    for (const e of o?.evidence || []) {
+      if ((bEv.has(evKey(e)) && !tEv.has(evKey(e))) || seen.has(evKey(e))) continue // 这台删了
+      seen.add(evKey(e))
+      evs.push({ ...e, id: eid(e) })
+    }
+    if (!evs.length) continue
+    const sk = t ? { ...t } : { ...o, id: fresh(usedS, o.id, 's') }
+    sk.evidence = evs.sort(evOrder)
+    sk.aliases = [...new Set([...(t?.aliases || []), ...(o?.aliases || [])])]
+    const used = [t?.lastUsedAt, o?.lastUsedAt].filter(Boolean).sort()
+    if (used.length) sk.lastUsedAt = used[used.length - 1]
+    trimEvidence(sk, new Set(evs.map(evKey).filter((x) => !bEv.has(x))))
+    skills.push(sk)
+  }
+  const on = (p) => p.enabled !== false
+  const oChanged = base ? on(ours) !== on(base) : true
+  const tChanged = base ? on(theirs) !== on(base) : true
+  const enabled = oChanged && tChanged ? on(ours) && on(theirs) : oChanged ? on(ours) : on(theirs)
+  const later = [ours.updatedAt, theirs.updatedAt].filter(Boolean).sort()
+  return { ...JSON.parse(JSON.stringify(theirs)), seq, skills, enabled, updatedAt: later[later.length - 1] || null }
+}
+
+function mergeJsonText(file, baseT, oursT, theirsT) {
+  const parse = (t) => {
+    if (t === undefined || t === null || !String(t).trim()) return undefined
+    try { return JSON.parse(t) } catch { return null }
+  }
+  const [b, o, t] = [parse(baseT), parse(oursT), parse(theirsT)]
+  if (file === 'index.json') return mergeIndex(b, o, t)
+  if (file === 'profile.json') return mergeProfile(b, o, t)
+  return null
+}
+
+// 一个提交里的全部文件：路径 → { mode, sha }
+function treeFiles(rev) {
+  const m = new Map()
+  if (!rev) return m
+  const r = gitRun(['ls-tree', '-r', '-z', '--full-tree', rev])
+  for (const rec of r.stdout.split('\0').filter(Boolean)) {
+    const tab = rec.indexOf('\t')
+    const [mode, , sha] = rec.slice(0, tab).split(' ')
+    if (!isJunk(rec.slice(tab + 1))) m.set(rec.slice(tab + 1), { mode, sha })
+  }
+  return m
+}
+
+// 算出「这台 + 仓库」合起来的样子，不动工作区和分支。
+// 课程目录整门课地比：只有一边改了取那边；两边改得一样随便取；两边都改了、内容不同，算冲突
+// （chosen 里的课程是用户已经选过的，按 prefer 取那一边）。根目录：index.json、profile.json 按内容合，
+// .gitignore 取两边的并集，其他文件哪边改了取哪边。
+// 返回 { ok: true, tree, head, other } / { ok: false, courses } / { ok: false, err }
+function planMerge(rref, { prefer = null, chosen = [] } = {}) {
+  const head = revOf('HEAD')
+  const other = revOf(rref)
+  const base = (git(['merge-base', head, other]) || '').trim() || null
+  const B = treeFiles(base)
+  const L = treeFiles(head)
+  const R = treeFiles(other)
+  const topOf = (p) => (p.includes('/') ? p.split('/')[0] : null)
+  const sub = (M, d) => new Map([...M].filter(([p]) => p.startsWith(`${d}/`)))
+  const same = (x, y) => x.size === y.size && [...x].every(([p, v]) => y.get(p)?.sha === v.sha && y.get(p)?.mode === v.mode)
+  const result = new Map()
+  const conflicts = []
+  const dirs = new Set([...B.keys(), ...L.keys(), ...R.keys()].map(topOf).filter(Boolean))
+  for (const d of dirs) {
+    const b = sub(B, d)
+    const l = sub(L, d)
+    const r = sub(R, d)
+    let pick
+    if (same(l, r) || same(b, r)) pick = l // 两边一样，或者只有这台改了
+    else if (same(b, l)) pick = r // 只有仓库那边改了
+    else if (chosen.includes(d)) pick = prefer === 'remote' ? r : l
+    else { conflicts.push(d); continue }
+    for (const [p, v] of pick) result.set(p, v)
+  }
+  if (conflicts.length) return { ok: false, courses: conflicts.sort() }
+  const blob = (M, p) => (M.has(p) ? (git(['cat-file', 'blob', M.get(p).sha]) ?? undefined) : undefined)
+  const hash = (text) => gitRun(['hash-object', '-w', '--stdin'], { input: text }).out
+  const eq = (x, y) => (x?.sha ?? null) === (y?.sha ?? null)
+  const roots = new Set([...B.keys(), ...L.keys(), ...R.keys()].filter((p) => !p.includes('/')))
+  for (const p of roots) {
+    const b = B.get(p)
+    const l = L.get(p)
+    const r = R.get(p)
+    if (eq(l, r) || eq(b, r)) { if (l) result.set(p, l); continue }
+    if (eq(b, l)) { if (r) result.set(p, r); continue }
+    let text
+    if (p === 'index.json' || p === 'profile.json') {
+      const merged = mergeJsonText(p, blob(B, p), blob(R, p), blob(L, p))
+      if (!merged) return { ok: false, err: `${p} 两边的内容合不上（有一边不是有效的 JSON）` }
+      text = JSON.stringify(merged, null, 2) + '\n'
+    } else if (p === '.gitignore') {
+      const lines = [...(blob(L, p) || '').split(/\r?\n/), ...(blob(R, p) || '').split(/\r?\n/)].filter(Boolean)
+      text = [...new Set(lines)].join('\n') + '\n'
+    } else { result.set(p, l || r); continue }
+    result.set(p, { mode: '100644', sha: hash(text) })
+  }
+  // 用户选过的课程，课程列表里那一条也取选的那边（标题等跟着课程走）
+  if (chosen.length && result.has('index.json')) {
+    try {
+      const idx = JSON.parse(git(['cat-file', 'blob', result.get('index.json').sha]))
+      const side = JSON.parse(blob(prefer === 'remote' ? R : L, 'index.json') || '{}')
+      let changed = false
+      for (const c of chosen) {
+        if (side.courses?.[c] && JSON.stringify(idx.courses?.[c]) !== JSON.stringify(side.courses[c])) { idx.courses[c] = side.courses[c]; changed = true }
+      }
+      if (changed) result.set('index.json', { mode: '100644', sha: hash(JSON.stringify(idx, null, 2) + '\n') })
+    } catch {}
+  }
+  // 合并结果里已经没有这门课的目录（一边删了课、另一边没动，或者选的那边没有这门课）：课程清单里也去掉
+  if (result.has('index.json')) {
+    try {
+      const idx = JSON.parse(git(['cat-file', 'blob', result.get('index.json').sha]))
+      const gone = Object.keys(idx.courses || {}).filter((c) => !result.has(`${c}/state.json`))
+      if (gone.length) {
+        for (const c of gone) delete idx.courses[c]
+        if (gone.includes(idx.current)) idx.current = null
+        result.set('index.json', { mode: '100644', sha: hash(JSON.stringify(idx, null, 2) + '\n') })
+      }
+    } catch {}
+  }
+  // 用临时的暂存区拼出目录树
+  const tmpIndex = path.join(HOME, '.git', `learn-merge-${process.pid}.index`)
+  try {
+    const env = { GIT_INDEX_FILE: tmpIndex }
+    gitRun(['read-tree', '--empty'], { env })
+    const info = [...result].map(([p, v]) => `${v.mode} ${v.sha}\t${p}\0`).join('')
+    const u = gitRun(['update-index', '-z', '--index-info'], { env, input: info })
+    if (!u.ok) return { ok: false, err: u.err }
+    const w = gitRun(['write-tree'], { env })
+    if (!w.ok) return { ok: false, err: w.err }
+    return { ok: true, tree: w.out, head, other }
+  } finally {
+    fs.rmSync(tmpIndex, { force: true })
+  }
+}
+
+// 拉下来或合并后工作区变了：当前课程链接、画像备份跟着更新
+// （备份还是旧画像的话，画像文件坏了恢复时会把别的电脑删掉的条目带回来）
+function afterTreeChange() {
+  relinkCurrent()
+  try {
+    if (!fs.existsSync(PROFILE)) fs.rmSync(PROFILE_BAK, { force: true })
+    else if (validProfile(readJson(PROFILE))) fs.copyFileSync(PROFILE, PROFILE_BAK)
+  } catch {}
+}
+
+// 工作区现在的样子（按 .gitignore），存成一棵目录树，不动暂存区
+function worktreeTree() {
+  const tmp = path.join(HOME, '.git', `learn-merge-${process.pid}.index`)
+  try {
+    const env = { GIT_INDEX_FILE: tmp }
+    if (!gitRun(['read-tree', 'HEAD'], { env }).ok || !gitRun(['add', '-A'], { env }).ok) return null
+    const w = gitRun(['write-tree'], { env })
+    return w.ok ? w.out : null
+  } finally {
+    fs.rmSync(tmp, { force: true })
+  }
+}
+
+// 把做到一半的合并补完：工作区和暂存区换成合并结果，再挪分支。
+// 工作区里既不是合并前、也不是合并结果的内容，先存进备份分支。返回 { ok, backup } / { ok: false, err }
+function finishMerge(m) {
+  const wt = worktreeTree()
+  if (!wt) return { ok: false, err: '读不了工作区' }
+  const H = treeFiles(m.head)
+  const C = treeFiles(m.commit)
+  const W = treeFiles(wt)
+  const odd = [...new Set([...H.keys(), ...C.keys(), ...W.keys()])].some((p) => {
+    const w = W.get(p)?.sha ?? null
+    return w !== (H.get(p)?.sha ?? null) && w !== (C.get(p)?.sha ?? null)
+  })
+  let backup = null
+  if (odd) {
+    const bc = gitRun([...idArgs(), 'commit-tree', wt, '-p', m.head, '-m', '合并被打断时工作区里的内容'])
+    if (!bc.ok) return { ok: false, err: bc.err }
+    backup = `backup/interrupted-${stamp()}`
+    git(['branch', '-f', backup, bc.out])
+  }
+  const r = gitRun(['read-tree', '--reset', '-u', m.commit])
+  if (!r.ok) return { ok: false, err: r.err }
+  const u = gitRun(['update-ref', '-m', 'learn: 补完被打断的合并', 'HEAD', m.commit, m.head])
+  if (!u.ok) return { ok: false, err: u.err }
+  fs.rmSync(MERGE_MARK, { force: true })
+  committed = true
+  afterTreeChange()
+  return { ok: true, backup }
+}
+
+// 上次合并做到一半（进程被杀、断电）：补完它。分支已经挪过去了（或者早就不是那次合并了）就只删记号
+function recoverMerge() {
+  if (!fs.existsSync(MERGE_MARK)) return
+  let m = null
+  try { m = readJson(MERGE_MARK) } catch {}
+  if (!m?.head || !m?.commit || revOf('HEAD') !== m.head || !refExists(m.commit)) { fs.rmSync(MERGE_MARK, { force: true }); return }
+  const f = finishMerge(m)
+  if (!f.ok) fail(`学习记录停在同步合并到一半的状态，自动补完失败（${f.err}），这次没有记录。把这句话告诉用户：需要在 ${HOME} 里手动处理（git status 查看）。`)
+  warnings.push(`上次合并同步记录时被打断，已经补完。${f.backup ? `当时工作区里另有改动，存在备份分支 ${f.backup}。` : ''}`)
+}
+
+// 把算好的结果落下来：生成合并提交（两个父提交：这台、仓库），先改工作区再挪分支。
+// 动手前在 .git 里留个记号，中途被打断时下一条命令先把合并补完（recoverMerge）。返回 null 或出错原因
+function applyMerge(plan, msg) {
+  const c = gitRun([...idArgs(), 'commit-tree', plan.tree, '-p', plan.head, '-p', plan.other, '-m', msg])
+  if (!c.ok) return c.err
+  const m = { head: plan.head, commit: c.out }
+  writeJson(MERGE_MARK, m)
+  const u = gitRun(['read-tree', '-m', '-u', plan.head, c.out])
+  if (!u.ok) {
+    // 一般是 git 检查不过、什么都没动；万一动了一半，补完它
+    if (!(git(['status', '--porcelain', '--ignore-submodules=dirty']) || '').trim()) { fs.rmSync(MERGE_MARK, { force: true }); return u.err }
+    const f = finishMerge(m)
+    if (!f.ok) return u.err
+    if (f.backup) warnings.push(`合并时工作区里另有改动，存在备份分支 ${f.backup}。`)
+    return null
+  }
+  const r = gitRun(['update-ref', '-m', `learn: ${msg}`, 'HEAD', c.out, plan.head])
+  if (!r.ok) {
+    // 分支挪不过去：工作区退回合并前，和分支对上；退不回去就留着记号，下一条命令补完合并
+    if (gitRun(['read-tree', '-m', '-u', c.out, plan.head]).ok) fs.rmSync(MERGE_MARK, { force: true })
+    return r.err
+  }
+  fs.rmSync(MERGE_MARK, { force: true })
+  committed = true
+  afterTreeChange()
+  return null
+}
+
+// 合并仓库里的新记录（这台也有新记录时）。返回 { ok: true } / { ok: false, courses } / { ok: false, err }
+function mergeRemote(rref, opts = {}) {
+  const plan = planMerge(rref, opts)
+  if (!plan.ok) return plan
+  const err = applyMerge(plan, '同步：合并另一台电脑的记录')
+  return err ? { ok: false, err } : { ok: true }
+}
+
+// 把同步仓库里新的记录拉下来
+function syncPull() {
+  const conf = syncConf()
+  if (!conf) return
+  commitAll('同步前保存这台电脑上的改动')
+  // 课程目录里放了别的 git 工作副本、里面有改动：学习记录的 git 提交不了它，不算没提交（--ignore-submodules=dirty）
+  if ((git(['status', '--porcelain', '--ignore-submodules=dirty']) || '').trim()) {
+    syncNotes.push(`⚠ 同步：这台有改动没能提交进 git${commitError ? `（${commitError}）` : ''}，这次没拉，免得冲掉。把这句话告诉用户。`)
+    return
+  }
+  updateSync({ lastTryAt: isoLocal() })
+  const f = fetchOrigin()
+  if (!f.ok) {
+    if (!isTransient(f.raw)) updateSync({ pullError: f.err })
+    syncNotes.push(`同步：这次没连上同步仓库（${f.err}），用的是这台电脑上的进度，联网后会自动补上。`)
+    return
+  }
+  updateSync({ pullError: null, lastPullAt: isoLocal(), needPull: false })
+  const rref = `origin/${conf.branch}`
+  if (!refExists(rref)) { // 仓库里还没有记录（或删掉重建了）：谈不上冲突，等推上去
+    if (loadSync().conflict) updateSync({ conflict: null })
+    return
+  }
+  if (!currentBranch()) { syncNotes.push('⚠ 同步：学习记录不在正常分支上，这次没合并。把这句话告诉用户。'); return }
+  if (!hasCommits()) {
+    gitRun(['reset', '-q', '--hard', rref])
+    git(['branch', `--set-upstream-to=${rref}`])
+    afterTreeChange()
+    return
+  }
+  const ab = aheadBehind(rref)
+  if (!ab) return
+  if (!ab.behind) { if (loadSync().conflict) updateSync({ conflict: null }); return }
+  if (!ab.ahead) {
+    const r = gitRun([...idArgs(), 'merge', '-q', '--ff-only', rref])
+    if (!r.ok) { syncNotes.push(`⚠ 同步：拉下来的记录没能合进来（${r.err}），这次用的是这台电脑上的进度。`); return }
+    afterTreeChange()
+    updateSync({ conflict: null })
+    syncNotes.push(`同步：拉到了 ${ab.behind} 条在别的电脑上记的记录。`)
+    return
+  }
+  const rr = mergeRemote(rref)
+  if (rr.ok) {
+    updateSync({ conflict: null })
+    syncNotes.push(`同步：拉到了 ${ab.behind} 条在别的电脑上记的记录，和这台的 ${ab.ahead} 条合在一起了。`)
+    return
+  }
+  if (!rr.courses) { syncNotes.push(`⚠ 同步：合并没成功（${rr.err}），这次用的是这台电脑上的进度，下次再试。`); return }
+  const c = describeConflict(rref, rr.courses)
+  updateSync({ conflict: c })
+  syncNotes.push(conflictText(c))
+}
+
+// 后台推，不让用户等：只推这条命令写完时的那个提交（后台进程不拿数据锁，推当时的 HEAD 可能推到别的命令写了一半的状态）。
+// 测试里设 LEARN_SYNC_FOREGROUND=1 当场推
+function startPush() {
+  if (process.env.LEARN_SYNC_FOREGROUND === '1') { pushNow({ wait: 35000 }); return }
+  const sha = revOf('HEAD')
+  if (!sha) return
+  try { spawn(process.execPath, [SELF, '_push', sha], { cwd: HOME, detached: true, stdio: 'ignore', windowsHide: true, env: process.env }).unref() } catch {}
+}
+
+// 推到同步仓库。返回 null 表示推上去了（或没有要推的），否则返回没推上去的原因。
+// wait：另一个进程正在推时最多等多久（毫秒）；0 表示后台推：不等，推不了也不记错误，交给前台命令。
+// sha：后台推时只推这个提交（前台命令拿着数据锁，推当时的 HEAD）
+function pushNow({ wait = 0, sha: only = null } = {}) {
+  const deadline = Date.now() + wait
+  let fd
+  for (;;) {
+    try { fd = fs.openSync(SYNC_LOCK, 'wx'); break } catch (e) {
+      if (e.code !== 'EEXIST') return wait ? `写不了 ${SYNC_LOCK}：${e.message}` : null
+      try { if (Date.now() - fs.statSync(SYNC_LOCK).mtimeMs > 90000) { fs.rmSync(SYNC_LOCK, { force: true }); continue } } catch {}
+      if (Date.now() > deadline) return wait ? '另一个学习窗口正在推送，稍后运行 learn sync 确认' : null
+      sleepMs(200)
+    }
+  }
+  try {
+    // 推的时候又有新提交：推完再看一眼（只推指定提交时推一次就够）
+    for (let i = 0; i < (only ? 1 : 3); i++) {
+      const ps = pushState()
+      if (!ps) { updateSync({ pushError: null }); return null }
+      if (ps.why) return wait ? ps.why : null
+      const conf = syncConf()
+      const sha = only || revOf('HEAD')
+      if (!sha) return null
+      if (only) {
+        const rref = `origin/${conf.branch}`
+        if (git(['merge-base', '--is-ancestor', only, 'HEAD']) === null) return null // 分支上已经没有这个提交
+        if (refExists(rref) && git(['merge-base', '--is-ancestor', only, rref]) !== null) return null // 仓库里已经有了
+      }
+      const r = gitRun([...noHooks(), '-c', 'push.gpgSign=false', 'push', '-q', 'origin', `${sha}:refs/heads/${conf.branch}`], { timeout: 30000, net: true })
+      if (!r.ok) {
+        const rejected = /\[rejected\]|non-fast-forward|fetch first/i.test(r.raw)
+        const why = rejected ? '同步仓库里有别的电脑新推的记录，要先拉下来' : r.err
+        updateSync(rejected ? { pushError: why, needPull: true } : { pushError: why })
+        return why
+      }
+      updateSync({ pushError: null, lastPushAt: isoLocal() })
+    }
+    return null
+  } finally {
+    fs.closeSync(fd)
+    fs.rmSync(SYNC_LOCK, { force: true })
+  }
+}
+
+function localHasData() {
+  let skills = 0
+  try { skills = loadProfile().skills.length } catch {}
+  return Object.keys(loadIndex().courses || {}).length > 0 || skills > 0
+}
+
+function dataSummary() {
+  const n = Object.keys(loadIndex().courses || {}).length
+  let k = 0
+  try { k = loadProfile().skills.length } catch {}
+  return `${n} 门课，画像 ${k} 个技能`
+}
+
+const stamp = () => isoLocal().slice(0, 19).replace(/[-:]/g, '').replace('T', '-')
+
+// 仓库里的东西是不是学习记录：根目录的 index.json 是课程清单，每个子目录都是一门课
+function looksLikeLearning(rref) {
+  let idx = null
+  try { idx = JSON.parse(git(['show', `${rref}:index.json`]) || 'null') } catch {}
+  if (!idx || typeof idx !== 'object' || idx.version !== VERSION || !idx.courses || typeof idx.courses !== 'object') return false
+  const dirs = (git(['ls-tree', '-d', '--name-only', rref]) || '').split('\n').filter(Boolean)
+  return dirs.every((d) => git(['cat-file', '-e', `${rref}:${d}/state.json`]) !== null)
+}
+
+// learn sync --remote <地址>：连同步仓库。中途失败就退回连之前的样子（原来连着别的仓库的，照旧连着）
+function syncSetup(url) {
+  if (/^[a-z+]+:\/\/[^/]*@/i.test(url) && !/^ssh:\/\//i.test(url)) fail('仓库地址里不要带用户名、密码或 token。用 git@github.com:<用户名>/<仓库名>.git、ssh://git@github.com/<用户名>/<仓库名>.git 或 https://github.com/<用户名>/<仓库名>.git，登录交给这台电脑的 git')
+  if (git(['--version']) === null) fail('这台电脑没有 git，装好 git 再连同步仓库')
+  const old = (git(['config', '--get', 'remote.origin.url']) || '').trim() || null
+  const brStart = currentBranch()
+  const upstream = brStart ? ['remote', 'merge'].map((k) => [`branch.${brStart}.${k}`, (git(['config', '--get', `branch.${brStart}.${k}`]) || '').trim() || null]) : []
+  const prevSync = loadSync()
+  const prevRefs = (git(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/origin']) || '').split('\n').filter(Boolean).map((x) => x.split(' '))
+  const undoRemote = () => {
+    for (const ref of (git(['for-each-ref', '--format=%(refname)', 'refs/remotes/origin']) || '').split('\n').filter(Boolean)) git(['update-ref', '-d', ref])
+    for (const [ref, sha] of prevRefs) git(['update-ref', ref, sha])
+    if (old) gitRun(['remote', 'set-url', 'origin', old]); else gitRun(['remote', 'remove', 'origin'])
+    writeJson(SYNC_FILE, prevSync)
+    syncCache = undefined
+  }
+  if (old) gitRun(['remote', 'set-url', 'origin', url])
+  else gitRun(['remote', 'add', 'origin', url])
+  // 以前连过的仓库留下的远程分支记录先清掉，免得拿旧仓库的状态做判断
+  for (const [ref] of prevRefs) git(['update-ref', '-d', ref])
+  const f = fetchOrigin(30000)
+  if (!f.ok) {
+    undoRemote()
+    fail(`连不上同步仓库：${f.err}\n检查：地址对不对、仓库是不是你的私有库、这台电脑的 git 能不能登录 GitHub（终端里运行 git ls-remote ${safeUrl(url)} 试试）。修好后再运行一次。`)
+  }
+  const branches = (git(['for-each-ref', '--format=%(refname:short)', 'refs/remotes/origin']) || '')
+    .split('\n').map((x) => x.trim()).filter((x) => x.startsWith('origin/') && x !== 'origin/HEAD')
+  const local = currentBranch() || 'main'
+  const rb = !branches.length ? local
+    : branches.includes(`origin/${local}`) ? local
+      : (['main', 'master'].find((b) => branches.includes(`origin/${b}`)) || branches[0].slice('origin/'.length))
+  const rref = `origin/${rb}`
+  if (branches.length && !looksLikeLearning(rref)) {
+    undoRemote()
+    fail('这个仓库里已经有别的内容，不是学习记录，没有连。换一个新建的空私有仓库再试（建仓库时什么都别勾，不要自动生成 README）。')
+  }
+  // 开同步：画像开始进 git。中途失败就退回连之前的样子
+  const headBefore = revOf('HEAD')
+  let headSetup = null // 「连上同步仓库」那次提交之后
+  let renamed = null // 分支改过名：{ from, backup }
+  const pausedHere = fs.existsSync(PROFILE) && loadProfile().enabled === false
+  updateSync({ enabled: true, url, branch: rb, conflict: null, needPull: false, pullError: null, pushError: null, lastTryAt: isoLocal(), lastPullAt: isoLocal() })
+  syncCache = undefined
+  const rollback = (why) => {
+    // 合并进来的别的电脑的课程先从工作区退掉，再退回连之前的提交（没提交的改动留在工作区）
+    if (headSetup && revOf('HEAD') !== headSetup) gitRun(['read-tree', '-m', '-u', 'HEAD', headSetup])
+    if (headBefore) git(['reset', '-q', '--mixed', headBefore])
+    else { git(['update-ref', '-d', 'HEAD']); git(['read-tree', '--empty']) }
+    if (renamed) {
+      git(['branch', '-M', renamed.from])
+      if (renamed.backup) { git(['branch', '-f', renamed.to, renamed.backup]); git(['branch', '-D', renamed.backup]) }
+    }
+    undoRemote()
+    for (const [k, v] of upstream) { if (v) git(['config', k, v]); else git(['config', '--unset', k]) }
+    ensureHome()
+    afterTreeChange()
+    fail(`${why}\n这次没有连上，${prevSync.enabled ? '还是连着原来的仓库' : '没有开同步'}；修好后再运行一次。`)
+  }
+  ensureHome()
+  commitAll('连上同步仓库：画像和进度一起同步')
+  headSetup = revOf('HEAD')
+  const tail = '之后每次开场自动拉、每次记录自动推；收尾时会说推没推上去。'
+  if (!branches.length) {
+    // 仓库是空的：把这台的记录推上去
+    if (!hasCommits()) gitRun([...idArgs(), 'commit', '-q', '--allow-empty', '-m', '建立学习记录'])
+    const why = pushNow({ wait: 35000 })
+    if (why) rollback(`连上了，但没推上去：${why}`)
+    git(['branch', `--set-upstream-to=${rref}`])
+    return `已连上同步仓库，这台电脑的进度和画像都推上去了（${dataSummary()}）。${tail}\n另一台电脑装好学习教练后，对它说「连上同步仓库 ${safeUrl(url)}」。`
+  }
+  if (!localHasData()) {
+    // 这台还没学过：直接用仓库里的；用户在这台说过暂停画像的，保持暂停
+    if (hasCommits()) git(['branch', '-f', `backup/local-${stamp()}`, 'HEAD'])
+    git(['symbolic-ref', 'HEAD', `refs/heads/${rb}`])
+    const r = gitRun(['reset', '-q', '--hard', rref])
+    if (!r.ok) rollback(`拉取失败：${r.err}`)
+    git(['branch', `--set-upstream-to=${rref}`])
+    if (local !== rb && refExists(`refs/heads/${local}`)) git(['branch', '-D', local])
+    ensureHome()
+    afterTreeChange()
+    let paused = ''
+    if (pausedHere && loadProfile().enabled !== false) {
+      withProfile((p) => { p.enabled = false })
+      commitAll('画像：保持暂停')
+      startPush()
+      paused = '画像按你在这台电脑上说的保持暂停。'
+    }
+    return `已连上同步仓库，把仓库里的进度和画像拉到了这台电脑（${dataSummary()}）。${paused}${tail}`
+  }
+  // 两边都有记录：分支名跟仓库对齐，再试着合
+  if (local !== rb) {
+    renamed = { from: local, to: rb, backup: null }
+    if (refExists(`refs/heads/${rb}`)) { renamed.backup = `backup/local-${rb}-${stamp()}`; git(['branch', '-f', renamed.backup, rb]) }
+    git(['branch', '-M', rb])
+  }
+  git(['branch', `--set-upstream-to=${rref}`])
+  // 推不上去：只是另一台刚推过（要先拉）就保持连着、之后自动拉了再推；仓库拒收、没权限等就退回连之前的样子
+  const pushOrRollback = () => {
+    const why = pushNow({ wait: 35000 })
+    if (why && !loadSync().needPull) rollback(`连上了，但没推上去：${why}`)
+    return why
+  }
+  const ab = aheadBehind(rref)
+  if (ab && !ab.ahead && !ab.behind) return `已连上同步仓库，这台电脑和同步仓库已经一致（${dataSummary()}）。${tail}`
+  if (ab && !ab.ahead) {
+    gitRun([...idArgs(), 'merge', '-q', '--ff-only', rref])
+    afterTreeChange()
+    return `已连上同步仓库，拉到了 ${ab.behind} 条在别的电脑上记的记录（${dataSummary()}）。${tail}`
+  }
+  if (ab && !ab.behind) {
+    const why = pushOrRollback()
+    return `已连上同步仓库，${why ? `但这台多出的 ${ab.ahead} 条没推上去（${why}），之后会自动重试` : `把这台多出的 ${ab.ahead} 条记录推上去了`}（${dataSummary()}）。${tail}`
+  }
+  const rr = mergeRemote(rref)
+  if (rr.ok) {
+    const why = pushOrRollback()
+    return `已连上同步仓库，这台电脑和仓库里原有的记录合在一起了（${dataSummary()}）。${why ? `但还没推上去（${why}），之后会自动重试。` : ''}${tail}`
+  }
+  if (!rr.courses) return `已连上同步仓库，但这次没合成（${rr.err}），之后会自动再试。${tail}`
+  const c = describeConflict(rref, rr.courses)
+  updateSync({ conflict: c })
+  return `已连上同步仓库，但有课程两边都有记录、合不到一起。\n${conflictText(c)}`
+}
+
+// learn sync --keep local|remote：冲突的课程留哪边；其余课程和画像照常合并。被替换掉的那份存进备份分支。
+// 冲突名单变了（用户选之前两边又改了别的课）就什么都不动，报新名单让用户重新选
+function syncKeep(which) {
+  if (!['local', 'remote'].includes(which)) fail('--keep 只能是 local（用这台电脑的）或 remote（用同步仓库里的）')
+  const conf = syncConf()
+  const st = loadSync()
+  if (!conf || !st.conflict) fail('现在没有同步冲突，不用选')
+  commitAll('选边前保存这台电脑上的改动')
+  const f = fetchOrigin()
+  if (!f.ok) fail(`没连上同步仓库：${f.err}。联网后再选`)
+  const rref = `origin/${conf.branch}`
+  const full = refExists(rref) ? planMerge(rref) : { ok: true }
+  if (!full.ok && !full.courses) fail(`合并没成功：${full.err}。这台的记录没动，稍后再试`)
+  if (full.ok) {
+    // 仓库删掉重建了，或者两边已经不冲突了：不用选，照常合并、推送
+    updateSync({ conflict: null })
+    syncPull()
+    const why = loadSync().conflict ? null : pushNow({ wait: 35000 })
+    return ['现在已经没有冲突的课程了，不用选，照常同步。', ...syncNotes.splice(0), why ? `这台的记录还没推上去（${why}），之后会自动重试。` : ''].filter(Boolean).join('\n')
+  }
+  const chosen = (st.conflict.courses || []).map((x) => x.name)
+  if (full.courses.some((x) => !chosen.includes(x))) {
+    const c = describeConflict(rref, full.courses)
+    updateSync({ conflict: c })
+    return `⚠ 冲突的课程变了，这次没有改动任何记录。把新的情况告诉用户，重新问留哪边：\n${conflictText(c)}`
+  }
+  const names = full.courses.map(courseLabel).join('、')
+  const backup = `backup/${which === 'remote' ? 'local' : 'remote'}-${stamp()}`
+  git(['branch', '-f', backup, which === 'remote' ? 'HEAD' : rref])
+  const rr = mergeRemote(rref, { prefer: which, chosen: full.courses })
+  if (!rr.ok) {
+    git(['branch', '-D', backup])
+    fail(`合并没成功：${rr.err || '原因不明'}。这台的记录没动，稍后再试`)
+  }
+  updateSync({ conflict: null, needPull: false })
+  const why = pushNow({ wait: 35000 })
+  return `已合好：${names}用${which === 'remote' ? '同步仓库里的' : '这台电脑的'}，其他课程和画像两边的都留着。被替换掉的那份存在备份分支 ${backup}，不会丢。${why ? `还没推上去（${why}），之后会自动重试。` : ''}`
 }
 
 // ---------- 会话 ----------
@@ -406,7 +1248,7 @@ function shortDate(dateStr) {
 
 function emptyProfile() {
   return {
-    _readme: '学习者画像，由 learn 脚本维护，不要手改。查看：learn profile；删一条：learn profile forget <id>；暂停：learn profile off；清空：learn profile reset --confirm yes。删课程不影响画像，删画像不影响课程进度。',
+    _readme: '学习者画像，由 learn 脚本维护，不要手改。查看：learn profile；删一条：learn profile forget <id> --name <技能名>；暂停：learn profile off；清空：learn profile reset --confirm yes。画像和课程进度互不影响：清空画像不会改动课程进度。',
     version: 1, enabled: true, seq: { s: 0, e: 0, v: 0 }, skills: [], createdAt: isoLocal(), updatedAt: null,
   }
 }
@@ -418,7 +1260,7 @@ function validProfile(p) {
   return p.skills.every((sk) => sk && typeof sk.id === 'string' && typeof sk.name === 'string'
     && (sk.aliases === undefined || Array.isArray(sk.aliases)) && Array.isArray(sk.evidence)
     && typeof (sk.lastUsedAt || sk.createdAt) === 'string'
-    && sk.evidence.every((e) => e && typeof e.id === 'string' && /^e\d+$/.test(e.id) && Object.hasOwn(EVIDENCE_NAMES, e.type)
+    && sk.evidence.every((e) => e && typeof e.id === 'string' && /^e\d+[a-z]*$/.test(e.id) && Object.hasOwn(EVIDENCE_NAMES, e.type)
       && LEVELS.includes(e.level) && typeof e.at === 'string' && /^\d{4}-\d{2}-\d{2}/.test(e.at)))
 }
 
@@ -471,6 +1313,7 @@ function withProfile(fn, { purgeBackup = false } = {}) {
     const out = fn(p)
     p.updatedAt = isoLocal()
     if (fs.existsSync(PROFILE)) fs.copyFileSync(PROFILE, PROFILE_BAK)
+    else fs.rmSync(PROFILE_BAK, { force: true }) // 画像被清空过（可能是在别的电脑上）：旧备份不能留着
     writeJson(PROFILE, p)
     if (purgeBackup) fs.copyFileSync(PROFILE, PROFILE_BAK)
     return out
@@ -484,7 +1327,7 @@ function findSkill(p, name) {
 
 // 现算一个技能的档位
 function skillLevel(sk) {
-  const ev = [...sk.evidence].sort((a, b) => a.at.localeCompare(b.at) || Number(a.id.slice(1)) - Number(b.id.slice(1)))
+  const ev = [...sk.evidence].sort(evOrder)
   let v = null
   let lastVerified = null
   let lastVerifiedIdx = -1
@@ -562,19 +1405,21 @@ function addEvidence(p, { name, type, level, course = null, ref, detail }) {
   if (!sk) {
     if (p.skills.length >= MAX_SKILLS) {
       const old = [...p.skills].sort((a, b) => (a.lastUsedAt || a.createdAt).localeCompare(b.lastUsedAt || b.createdAt)).slice(0, 5)
-      fail(`画像里技能已满 ${MAX_SKILLS} 条。请用户选一条删掉（learn profile forget <id>）：${old.map((x) => `${x.id} ${x.name}`).join('、')}`)
+      fail(`画像里技能已满 ${MAX_SKILLS} 条。请用户选一条删掉（learn profile forget <id> --name "<技能名>"）：${old.map((x) => `${x.id} ${x.name}`).join('、')}`)
     }
     p.seq.s += 1
-    sk = { id: `s${p.seq.s}`, name, aliases: [], evidence: [], createdAt: isoLocal(), lastUsedAt: null }
+    sk = { id: `s${p.seq.s}${idTag()}`, name, aliases: [], evidence: [], createdAt: isoLocal(), lastUsedAt: null }
     p.skills.push(sk)
     created = true
   }
-  if (ref && sk.evidence.some((e) => e.ref === ref && e.course === course && e.type === type)) {
+  // 同一次操作重复写入才算重复：编号相同、内容也相同（选边同步后课程里的编号可能退回去，同号的新结果要照记）
+  if (ref && sk.evidence.some((e) => e.ref === ref && e.course === course && e.type === type && e.level === level && (e.detail || null) === (detail || null))) {
     return `画像：「${sk.name}」已有这条记录（${ref}），没有重复记入。`
   }
   p.seq.e += 1
-  const e = { id: `e${p.seq.e}`, type, level, at: dateLocal(), course, ref: ref || null, detail: detail || null }
+  const e = { id: `e${p.seq.e}${idTag()}`, type, level, at: dateLocal(), ts: now().toISOString(), course, ref: ref || null, detail: detail || null }
   sk.evidence.push(e)
+  sk.evidence.sort(evOrder)
   // 每个技能最多留 MAX_EVIDENCE 条：先丢最旧的自述，再丢最旧的验证；结业永远保留；刚记入的这条不丢
   while (sk.evidence.length > MAX_EVIDENCE) {
     const pick = (f) => sk.evidence.findIndex((x) => x !== e && f(x))
@@ -586,7 +1431,7 @@ function addEvidence(p, { name, type, level, course = null, ref, detail }) {
   sk.lastUsedAt = isoLocal()
   const lv = skillLevel(sk)
   const first = p.skills.length === 1 && sk.evidence.length === 1 && created
-  return `画像：已记入「${sk.name}」${e.id}（${EVIDENCE_NAMES[type]}：${LEVEL_NAMES[level]}），现在算${levelText(lv)}。不对就说「删掉这条」（learn profile forget ${e.id}）。`
+  return `画像：已记入「${sk.name}」${e.id}（${EVIDENCE_NAMES[type]}：${LEVEL_NAMES[level]}），现在算${levelText(lv)}。不对就说「删掉这条」（learn profile forget ${e.id} --name "${sk.name}"）。`
     + (first ? `\n画像存在 ${PROFILE}，只记学习相关的技能；查看：learn profile` : '')
 }
 
@@ -600,10 +1445,14 @@ function profileWriteSafe(fn) {
 }
 
 // ---------- 先修问答 ----------
-// s.prereq = { setAt, none, asked, quizSeq, batchStart, batchKind,
+// s.prereq = { setAt, none, asked, quizSeq, qStart, batchNo, batchKind,
 //   items: [{ name, role, reason, cue, source, state, answer, decision, recommend, note, quizLevel, addedAt }] }
 // state：ask 问会不会 / quiz 出验证题 / decide 问怎么补 / done 已定
-// 题数按批算：首次列清单、每次 --append 各一批；asked 只增不减（画像证据的 ref 用它编号）
+// 会不会：本批所有待问项放进一次提问，不限题数；验证题按批限 PREREQ_BUDGET 道，一次一道
+// 验证题按批计数：首次列清单、每次 --append 各一批（上一批还有项在问会不会、等出验证题时追加的并入上一批；
+// 只剩待定怎么补的项不算没定完）；课中缺口（gap）不属于任何一批；
+// batchNo 是当前批号，每项记 batch；qStart 是本批开始时的 quizSeq
+// asked（问过几次会不会）和 quizSeq 只增不减，画像证据的 ref 用它们编号
 
 function prereqItem(s, name) {
   const k = canonKey(name)
@@ -640,16 +1489,63 @@ function classifyItem(it, p) {
   }
 }
 
-const usedInBatch = (s) => s.prereq.asked - (s.prereq.batchStart || 0)
-const hasBudget = (s) => usedInBatch(s) < PREREQ_BUDGET
+const quizzesInBatch = (s) => (s.prereq.quizSeq || 0) - (s.prereq.qStart || 0)
+const inBatch = (s, x) => (x.batch || 0) === (s.prereq.batchNo || 0) && x.source !== 'gap'
 
-// 预算用完时，还没问的项按规则直接定；必需项一律交给用户决定怎么补，不凭自述定成已会
-function exhaust(it) {
-  if (it.state === 'ask') {
-    if (it.role === 'core') { setDecide(it, 'inline'); it.note = '没来得及问' } else setDone(it, it.role === 'general' ? 'inline' : 'dropped')
-  } else if (it.state === 'quiz') {
-    if (it.role === 'core') { setDecide(it, 'inline'); it.note = '没来得及验证' } else setDone(it, 'dropped')
+// v0.3 的档案没有批号：按还在问会不会、等出验证题的项推出当前这批（其中最早的一项之后加的都算），名额只算这批出过的题
+function migratePrereq(pr) {
+  if (pr.batchNo !== undefined) return
+  const pend = pr.items.filter((x) => (x.state === 'ask' || x.state === 'quiz') && x.source !== 'gap')
+  if (pend.length) {
+    const from = pend.map((x) => x.addedAt || '').sort()[0]
+    const batch = pr.items.filter((x) => x.source !== 'gap' && (x.addedAt || '') >= from)
+    for (const x of batch) x.batch = 1
+    pr.batchNo = 1
+    pr.qStart = Math.max(0, (pr.quizSeq || 0) - batch.filter((x) => x.quizLevel).length)
+  } else {
+    pr.batchNo = 0
+    pr.qStart = pr.quizSeq || 0
+    pr.plannedBatch = 0
   }
+  delete pr.batchStart
+}
+
+// 分不到验证题名额的项：必需项一律交给用户决定怎么补，不凭自述定成已会；可类比项不拿来打比方
+const SELF_TEXT = { A: '自述能独立做', B: '自述会一点', D: '不确定' }
+function exhaust(it) {
+  if (it.role === 'core') setDecide(it, 'inline')
+  else setDone(it, 'dropped')
+  it.note = `${SELF_TEXT[it.answer] ? `${SELF_TEXT[it.answer]}，` : ''}名额用完没验证`
+}
+
+// 验证题名额的分配顺序：本批必需第 1 项 → 可类比第 1 项 → 其余必需 → 其余可类比
+// （保证至少验证一个能拿来打比方的技能）。只排要出题和已经出过题的项，出过题的项也占着位置
+function quizOrder(s) {
+  const batch = s.prereq.items.filter((x) => inBatch(s, x) && (x.state === 'quiz' || x.quizLevel))
+  const core = batch.filter((x) => x.role === 'core')
+  const rel = batch.filter((x) => x.role === 'related')
+  return [...core.slice(0, 1), ...rel.slice(0, 1), ...core.slice(1), ...rel.slice(1)].filter((x) => x.state === 'quiz')
+}
+
+// 会不会都问完后，分不到名额的项在这里定掉；返回本批还能出题的项（按顺序）。
+// 新定掉的项记进 s.prereq.untold（存档），下一次给出「下一步」时让模型告诉用户，然后清掉
+function settleQuizzes(s) {
+  if (!s.prereq || s.prereq.items.some((x) => x.state === 'ask')) return []
+  const order = quizOrder(s)
+  const left = Math.max(0, PREREQ_BUDGET - quizzesInBatch(s))
+  const gone = order.slice(left)
+  for (const it of gone) exhaust(it)
+  if (gone.length) s.prereq.untold = [...new Set([...(s.prereq.untold || []), ...gone.map((x) => x.name)])]
+  return order.slice(0, left)
+}
+
+function exhaustedNotice(s) {
+  const gone = (s.prereq.untold || []).map((n) => s.prereq.items.find((x) => x.name === n)).filter(Boolean)
+  delete s.prereq.untold
+  if (!gone.length) return ''
+  const rel = gone.filter((x) => x.role !== 'core').map((x) => `「${x.name}」`)
+  const core = gone.filter((x) => x.role === 'core').map((x) => `「${x.name}」`)
+  return `先用一句话告诉用户：本批验证题名额用完了，${[rel.length && `${rel.join('、')}没验证，这门课不拿它打比方`, core.length && `${core.join('、')}没验证，之后问怎么补时一起问`].filter(Boolean).join('；')}。\n`
 }
 
 // 处理顺序：必需 → 可类比 → 有帮助
@@ -658,25 +1554,42 @@ function orderedItems(s) { return [...s.prereq.items].sort((a, b) => ROLE_ORDER[
 
 function pendingItems(s) { return (s.prereq?.items || []).filter((x) => x.state !== 'done') }
 
-// 给出下一步该做什么；预算用完的项在这里自动定掉
+// 给出下一步该做什么；分不到验证题名额的项在这里自动定掉
 function prereqNext(s) {
-  for (const it of orderedItems(s)) {
-    if ((it.state === 'ask' || it.state === 'quiz') && !hasBudget(s)) exhaust(it)
-    // 可类比的技能要问 + 验证两题才用得上；剩不到两题就不问了，把名额留给别的项
-    if (it.role === 'related' && it.state === 'ask' && PREREQ_BUDGET - usedInBatch(s) < 2) exhaust(it)
+  settleQuizzes(s)
+  const tell = exhaustedNotice(s)
+  const next = prereqStep(s)
+  return next ? tell + next : (tell.trim() || null)
+}
+
+function prereqStep(s) {
+  const asks = orderedItems(s).filter((x) => x.state === 'ask')
+  if (asks.length) {
+    // 同一批已经记过答案：剩下的多半在刚才那次提问里答过了，直接记，别再问一遍
+    const answered = s.prereq.items.some((x) => inBatch(s, x) && x.answer)
+    const head = answered
+      ? `下一步：下面 ${asks.length} 项还没记会不会。用户在刚才那次提问里已经答了的，直接逐项记，不要再问；还没问过的，用 1 次 ask_user_question 一起问（问会不会不占验证题名额）：\n`
+      : asks.length === 1
+        ? `下一步：用 ask_user_question 问「${asks[0].name}」会不会（问会不会不占验证题名额）：\n`
+        : `下一步：用 1 次 ask_user_question 一起问下面 ${asks.length} 项会不会，每项一题（问会不会不占验证题名额）：\n`
+    return head
+      + asks.map((x) => `  ${x.name}：本课用它${x.reason}${x.cue ? `（看到 ${x.cue} 才问的，题面说出来）` : ''}`).join('\n')
+      + '\n每题题面问一个具体任务，不问笼统水平；选项固定：A 能独立做 / B 会一点，要查资料 / C 没接触过 / D 不确定。'
+      + '\n答完逐项记：learn prereq answer "<技能>" <A|B|C|D> [--quote "<用户原话>"]'
   }
-  const it = orderedItems(s).find((x) => x.state === 'ask' || x.state === 'quiz')
-  if (it && it.state === 'ask') {
-    return `下一步：问「${it.name}」会不会（已问 ${usedInBatch(s)}/${PREREQ_BUDGET} 题）。用 ask_user_question，题面问具体任务（本课用它：${it.reason}${it.cue ? `；说明是看到 ${it.cue} 才问的` : ''}），选项固定：A 能独立做 / B 会一点，要查资料 / C 没接触过 / D 不确定。\n答完：learn prereq answer "${it.name}" <A|B|C|D> [--quote "<用户原话>"]`
-  }
-  if (it && it.state === 'quiz') {
-    return `下一步：给「${it.name}」出 1 道验证题（已问 ${usedInBatch(s)}/${PREREQ_BUDGET} 题）：预测输出、找错或解释为什么，不问定义，贴近本课用它的地方（${it.reason}）。判档：答对并说出原因 mastered，答对但说不出原因 partial，答错 none。\n答完：learn prereq quiz "${it.name}" <mastered|partial|none> --detail "<题目要点和回答>"（--detail 里不写 ${BANNED_WORDS.join('、')}）`
+  const it = settleQuizzes(s)[0]
+  if (it) {
+    return `下一步：给「${it.name}」出 1 道验证题（本批验证题已出 ${quizzesInBatch(s)}/${PREREQ_BUDGET}）。一次只出这一题：ask_user_question 里只放这一题，记下结果再出下一题。\n`
+      + `出题：预测输出、找错或解释为什么，不问定义，贴近本课用它的地方（${it.reason}）。用选择题时，有且只有一个选项是对的，选项说明不暗示对错，最后一项是「不确定 / 说不清」。\n`
+      + '判档：答错 none；答对但没说原因 partial（选择题选对了，先追问一句「为什么」再判）；答对且原因说得通 mastered。\n'
+      + `答完：learn prereq quiz "${it.name}" <mastered|partial|none> --detail "<题目要点和回答>"（--detail 里不写 ${BANNED_WORDS.join('、')}）`
   }
   const dec = s.prereq.items.filter((x) => x.state === 'decide')
   if (dec.length) {
     return `下一步：用一个问题问用户这几项先修怎么补（每项先说本课用它做什么，再给 4 个选项和各自后果，标出推荐项；多项时加一个「全部按推荐」）：\n`
       + dec.map((x) => `  ${x.name}：推荐「${DECISION_NAMES[x.recommend]}」${x.note ? `（${x.note}）` : ''}`).join('\n')
       + '\n选项：learn-first 先补 / inline 边学边补 / separate 先单独学一门 / skip 跳过'
+      + '\n用户在刚才的问题里已经选过的，直接逐项记，不要再问。'
       + '\n答完：learn prereq decide "<技能>" <learn-first|inline|separate|skip>；全部按推荐：learn prereq decide --all-recommended'
   }
   return null
@@ -695,12 +1608,15 @@ function prereqLine(it) {
 }
 
 function prereqReport(s, { withNext = true } = {}) {
+  if (!s.prereq.items.length && s.prereq.none) return `先修：这门课不需要（${s.prereq.none}）。${withNext ? `下一步：${afterPrereq(s)}` : ''}`.trim()
+  settleQuizzes(s)
   const items = orderedItems(s)
-  const next = prereqNext(s)
-  const out = [`先修清单（${items.length} 项，本批已问 ${usedInBatch(s)}/${PREREQ_BUDGET} 题）：`, ...items.map((x) => `  ${prereqLine(x)}`)]
+  const out = [`先修清单（${items.length} 项，本批验证题已出 ${quizzesInBatch(s)}/${PREREQ_BUDGET}）：`, ...items.map((x) => `  ${prereqLine(x)}`)]
   if (!withNext) return out.join('\n')
-  if (next) out.push(next)
-  else out.push(`先修问答完成。下一步：${afterPrereq(s)}`)
+  const tell = exhaustedNotice(s)
+  const next = prereqStep(s)
+  if (next) out.push(tell + next)
+  else out.push(`${tell}先修问答完成。下一步：${afterPrereq(s)}`)
   return out.join('\n')
 }
 
@@ -716,12 +1632,22 @@ function waitText(s) {
 }
 
 // 先修问答做完之后做什么
+// 先修改成不先补了，路线里还留着它没学完的先修节
+function orphanPrereqLessons(s) {
+  return s.lessons.filter((l) => l.kind === 'prereq' && !isDone(l) && !l.doneAt && !(s.prereq?.items || []).some((x) => x.name === l.prereqSkill && x.decision === 'learn-first'))
+}
+function orphanText(ls) {
+  return `路线里第 ${ls.map((l) => l.id).join('、')} 节是${[...new Set(ls.map((l) => `「${l.prereqSkill}」`))].join('、')}的先修节，但用户已经改成不先补了，不要开讲：用 learn set-plan 去掉这几节（learn plan 看当前路线；已经开始学的加 --force yes），别的节 requires 里的这几个节号会自动去掉`
+}
+
 function afterPrereq(s) {
   if (!s.lessons.length) return nextSetupStep(s)
   if (waitingItems(s).length) return waitText(s)
+  const orphan = orphanPrereqLessons(s)
+  if (orphan.length) return orphanText(orphan)
   const missing = s.prereq.items.filter((x) => x.decision === 'learn-first' && !s.lessons.some((l) => l.kind === 'prereq' && l.prereqSkill === x.name))
   if (missing.length) return `给${missing.map((x) => `「${x.name}」`).join('、')}加 1-2 节先修节（learn-plan 调整路线：learn plan 看当前路线，新节用没用过的 id，已有节不改号）`
-  if (s.prereq.batchKind === 'append') return '按 learn-plan 排新阶段的节，用到这些先修的节在 uses 里写上（learn plan 看当前路线）'
+  if (s.prereq.plannedBatch !== (s.prereq.batchNo || 0) && s.prereq.items.some((x) => x.source === 'append' && inBatch(s, x))) return '按 learn-plan 排新阶段的节，用到这些先修的节在 uses 里写上（learn plan 看当前路线）'
   return '接着当前节'
 }
 
@@ -834,7 +1760,8 @@ commands.init = ({ pos, flags }) => {
   fs.writeFileSync(path.join(courseDir(name), 'log.md'), `# ${s.title} 学习日记\n\n`)
   const idx = loadIndex()
   idx.courses[name] = { title: s.title, createdAt: s.createdAt, lastActive: s.createdAt }
-  writeJson(INDEX, idx)
+  idx.current = name
+  saveIndex(idx)
   setCurrentLink(name)
   saveState(name, s, '创建课程')
   return `已创建课程 ${name}，并设为当前课程。${forPrereq ? `结业时会自动通知课程 ${forPrereq[0].course}（它在等「${forPrereq[0].skill}」）。` : ''}下一步：立目标（learn-intake 第 2 步，learn set-goal）。`
@@ -845,7 +1772,7 @@ commands.use = ({ pos }) => {
   if (!fs.existsSync(stateFile(name))) fail(`找不到课程 ${name}`)
   const idx = loadIndex()
   idx.current = name
-  writeJson(INDEX, idx)
+  saveIndex(idx)
   setCurrentLink(name)
   return `已切换到 ${name}。\n\n` + commands.status({ pos: [], flags: {} })
 }
@@ -937,7 +1864,9 @@ function wirePrereqLessons(s, list) {
     if (l.kind === 'prereq') {
       const it = l.prereqSkill && find(l.prereqSkill)
       if (!it) fail(`第 ${l.id} 节是先修节，prereqSkill 必须是先修清单里的技能（现有：${items.map((x) => x.name).join('、') || '无'}）`)
-      if (it.decision !== 'learn-first') {
+      const learned = s.lessons.some((o) => o.id === l.id && o.kind === 'prereq' && o.prereqSkill === it.name && (isDone(o) || o.doneAt))
+      if (it.decision !== 'learn-first' && !learned) {
+        if (s.lessons.some((o) => o.id === l.id && o.kind === 'prereq')) fail(`先修「${it.name}」现在是「${decisionName(it) || '未定'}」，不用先修节了：第 ${l.id} 节从路线里去掉（已经开始学的加 --force yes）；用户要改回先补就先 learn prereq decide "${it.name}" learn-first`)
         if (DECISIONS.includes(it.decision)) fail(`先修「${it.name}」的决定是「${decisionName(it)}」，不用加先修节；用户要改成先补就先 learn prereq decide "${it.name}" learn-first`)
         fail(`先修「${it.name}」是「${decisionName(it) || '未定'}」，不需要先修节：第 ${l.id} 节去掉 kind:prereq（改成正课）或删掉`)
       }
@@ -990,6 +1919,9 @@ commands['set-plan'] = ({ flags }) => {
     const o = old.get(n.id)
     if (n.uses === undefined && o && (o.uses || []).length) { n.uses = [...o.uses]; inherited.push(`第 ${n.id} 节（${o.uses.join('、')}）`) }
   }
+  // 去掉的先修节：别的节 requires 里的这个节号自动去掉（先修节是改成先补时自动加进 requires 的）
+  const droppedPre = new Set(s.lessons.filter((l) => l.kind === 'prereq' && !list.some((x) => x.id === l.id)).map((l) => l.id))
+  for (const n of list) if (Array.isArray(n.requires)) n.requires = n.requires.filter((r) => !droppedPre.has(r))
   wirePrereqLessons(s, list)
   checkPlan(list)
   const removed = s.lessons.filter((l) => !list.some((x) => x.id === l.id) && hasRecord(l))
@@ -1025,6 +1957,7 @@ commands['set-plan'] = ({ flags }) => {
     const unmet = unmetRequires(s, l)
     if (l.status === 'in_progress' && !l.forced && unmet.length) { l.status = 'todo'; paused.push(`第 ${l.id} 节先暂停（做过的步骤保留），先学第 ${unmet.join('、')} 节；学完再 learn start ${l.id}（不带 --steps）接着做。`) }
   }
+  if (s.prereq) s.prereq.plannedBatch = s.prereq.batchNo || 0 // 这一批先修之后排过路线了
   saveState(name, s, `${old.size ? '调整' : '制定'}计划：共 ${s.lessons.length} 节`)
   const n = nextLesson(s)
   const lines = [`计划已保存，共 ${s.lessons.length} 节。`]
@@ -1363,6 +2296,8 @@ commands.status = ({ flags }) => {
     }
   }
   out.push(prog)
+  const orphan = orphanPrereqLessons(s)
+  if (orphan.length) out.push(`⚠ ${orphanText(orphan)}`)
   if (cur?.passCriteria) out.push(criteriaLine(cur))
   // 检验备注：本节检验过就给本节最近一次，否则给最近检验过的那一节（细化新一节时参考）
   const lastNote = (l) => l.notes?.length ? l.notes[l.notes.length - 1] : null
@@ -1405,11 +2340,14 @@ commands.status = ({ flags }) => {
 
   // 先修和画像：只给本课用得上的几行，不倒出整份画像
   const pend = pendingItems(s)
-  if (pend.length) {
+  const untold = s.prereq?.untold?.length
+  const pnext = s.prereq ? prereqNext(s) : null
+  if (untold && !s.prereq.untold) writeJson(stateFile(name), s) // 已经让模型告诉用户了：记下，免得下次再说
+  if (pend.length && pnext) {
     const src = new Set(pend.map((x) => x.source))
     const why = src.size === 1 && src.has('gap') ? '（课中发现的缺口）' : src.size === 1 && src.has('append') ? '（新阶段的先修）' : ''
-    out.push(`先修还有 ${pend.length} 项没定${why}：\n${prereqNext(s)}`)
-  }
+    out.push(`先修还有 ${pend.length} 项没定${why}：\n${pnext}`)
+  } else if (pnext) out.push(pnext)
   const items = s.prereq?.items || []
   const usesOf = (nm) => s.lessons.filter((l) => !isDone(l) && (l.uses || []).includes(nm)).map((l) => l.id)
   const listBy = (d) => items.filter((x) => x.decision === d).map((x) => {
@@ -1436,14 +2374,19 @@ commands.status = ({ flags }) => {
 
 // ---------- 先修问答命令 ----------
 
-function newPrereq() { return { setAt: isoLocal(), none: null, asked: 0, quizSeq: 0, batchStart: 0, batchKind: 'intake', items: [] } }
+function newPrereq() { return { setAt: isoLocal(), none: null, asked: 0, quizSeq: 0, qStart: 0, batchNo: 0, batchKind: 'intake', items: [] } }
 
 commands.prereq = ({ pos, flags }) => {
   const sub = pos[0] || 'show'
   const name = pickCourse(flags)
-  const s = loadState(name)
+  const s = loadState(name) // 分不到验证题名额的项，读的时候已经定掉了
   if (sub === 'show') {
-    if (s.prereq) return prereqReport(s)
+    if (s.prereq) {
+      const untold = s.prereq.untold?.length
+      const out = prereqReport(s)
+      if (untold && !s.prereq.untold) writeJson(stateFile(name), s) // 已经让模型告诉用户了：记下，免得下次再说
+      return out
+    }
     // 早期建的课（有路线、没有先修问答这一步）：不补做，以后需要时再追加
     if (s.lessons.length) return '这门课建课时还没有先修问答这一步，不用补做。展开新阶段时用 learn prereq set --append 问新用到的技能；课中发现缺本课以外的技能用 learn prereq gap。'
     return `还没做先修问答。下一步：${nextSetupStep(s)}`
@@ -1483,8 +2426,9 @@ commands.prereq = ({ pos, flags }) => {
       classifyItem(it, p)
       added.push(it)
     }
-    // 上一批都定完了，这一批重新算题数
-    if (!pendingItems(s).length) s.prereq.batchStart = s.prereq.asked
+    // 上一批没有项在问会不会、等出验证题了，开新的一批，重新算验证题数（只剩待定怎么补的不拦着）
+    if (!s.prereq.items.some((x) => x.state === 'ask' || x.state === 'quiz')) { s.prereq.qStart = s.prereq.quizSeq || 0; s.prereq.batchNo = (s.prereq.batchNo || 0) + 1 }
+    for (const it of added) it.batch = s.prereq.batchNo
     s.prereq.batchKind = flags.append ? 'append' : 'intake'
     s.prereq.items.push(...added)
     const report = prereqReport(s)
@@ -1506,17 +2450,15 @@ commands.prereq = ({ pos, flags }) => {
     const receipt = ANSWER_LEVEL[letter]
       ? profileWriteSafe((p) => addEvidence(p, { name: it.name, type: 'self', level: ANSWER_LEVEL[letter], course: name, ref: `prereq-a${s.prereq.asked}`, detail: quote ? `「${quote}」` : `先修问答选 ${letter}${it.cue ? `（看到 ${it.cue} 问的）` : ''}` }))
       : '画像：选了「不确定」，不记入。'
-    const budget = hasBudget(s)
     if (it.role === 'core') {
-      // 必需项不凭自述定成已会：有名额就验证，没名额交给用户决定怎么补
+      // 必需项不凭自述定成已会：都出验证题；分不到名额的由脚本转成问怎么补
       if (letter === 'C') setDecide(it, 'learn-first')
-      else if (budget) it.state = 'quiz'
-      else { setDecide(it, 'inline'); it.note = letter === 'D' ? '不确定，没来得及验证' : `自述${letter === 'A' ? '能独立做' : '会一点'}，没来得及验证` }
+      else it.state = 'quiz'
     } else if (it.role === 'general') {
       if (letter === 'A' || letter === 'B') setDone(it, 'known')
       else if (letter === 'C') setDecide(it, 'inline')
       else setDone(it, 'inline')
-    } else if ((letter === 'A' || letter === 'B') && budget) it.state = 'quiz'
+    } else if (letter === 'A' || letter === 'B') it.state = 'quiz'
     else setDone(it, 'dropped')
     const report = prereqReport(s)
     saveState(name, s, `先修「${it.name}」：选 ${letter}`)
@@ -1529,9 +2471,10 @@ commands.prereq = ({ pos, flags }) => {
     const level = need(pos[2], '档位 mastered|partial|none')
     if (!LEVELS.includes(level)) fail('档位只能是 mastered（答对并说出原因）/ partial（答对但说不出原因）/ none（答错）')
     if (it.state !== 'quiz') fail(`「${it.name}」现在不需要出验证题：${prereqLine(it)}`)
+    const asks = s.prereq.items.filter((x) => x.state === 'ask')
+    if (asks.length) fail(`先把这一批的「会不会」记完（还差：${asks.map((x) => x.name).join('、')}，learn prereq answer …），再出验证题；验证题名额要等会不会都记完才分`)
     const detail = checkText(need(flags.detail, '--detail（题目要点和回答）'), '--detail')
-    s.prereq.asked += 1
-    s.prereq.quizSeq += 1
+    s.prereq.quizSeq = (s.prereq.quizSeq || 0) + 1
     const receipt = profileWriteSafe((p) => addEvidence(p, { name: it.name, type: 'quiz', level, course: name, ref: `prereq-q${s.prereq.quizSeq}`, detail }))
     it.quizLevel = level
     if (it.role === 'related') setDone(it, level === 'none' ? 'dropped' : 'anchor')
@@ -1553,17 +2496,23 @@ commands.prereq = ({ pos, flags }) => {
     } else {
       const it = prereqItem(s, need(pos[1], '技能名'))
       const d = need(pos[2], '决定 learn-first|inline|separate|skip')
+      // 名额用完、没验证就不拿来打比方的可类比项：用户坚持说会、验证过了，可以改回拿来打比方
+      const droppedRelated = it.role === 'related' && it.state === 'done' && it.decision === 'dropped' && !it.quizLevel && /名额用完/.test(it.note || '')
       if (d === 'known') {
-        // 只给「先单独学一门」的项解除等待用，而且画像里要有验证过的记录
-        if (it.decision !== 'separate') fail(`只有选了「先单独学一门」的先修能改成已会；「${it.name}」现在是：${prereqLine(it)}`)
+        // 待定怎么补、或在等「先单独学一门」的项，用户后来验证过会了：改成已会。画像里要有验证过的记录
+        if (it.state !== 'decide' && it.decision !== 'separate' && !droppedRelated) fail(`只有待定怎么补、选了「先单独学一门」、或名额用完没验证的可类比项能改成已会；「${it.name}」现在是：${prereqLine(it)}`)
         const p = loadProfile()
-        const sk = p.enabled ? findSkill(p, it.name) : null
+        if (!p.enabled) fail('画像暂停中，不能凭画像改成已会。可以改选 learn-first / inline / skip（选了先单独学一门的也可以继续等）；要不要恢复画像（learn profile on）由用户决定')
+        const sk = findSkill(p, it.name)
         const lv = sk && skillLevel(sk)
-        if (!lv || !lv.verified || lv.stale || lv.level === 'none') fail(`画像里还没有「${it.name}」验证过的记录。先出 1 道验证题，learn profile verify "${it.name}" <档> --detail "…"，再改成已会${p.enabled ? '' : '（画像暂停中，只能改选 inline 或 skip）'}`)
+        // 最近一次验证要在 180 天内、不是「不会」，也不是刚降过档等复核的
+        if (!lv || !lv.verified || lv.stale || lv.level === 'none' || lv.basis.level === 'none' || lv.flags.includes('上次验证降了档，需复核')) fail(`画像里「${it.name}」最近一次验证没过、或还没有验证过的记录。先出 1 道验证题，learn profile verify "${it.name}" <档> --detail "…"，答对了再改成已会`)
       } else if (!DECISIONS.includes(d)) fail(`决定只能是：learn-first 先补 / inline 边学边补 / separate 先单独学一门 / skip 跳过`)
-      if (!(it.state === 'decide' || (it.state === 'done' && DECISIONS.includes(it.decision)))) fail(`「${it.name}」不需要决定怎么补：${prereqLine(it)}`)
-      setDone(it, d)
+      // 问怎么补时选定的（包括后来改成已会的）都可以改
+      if (!(d === 'known' && droppedRelated) && !(it.state === 'decide' || (it.state === 'done' && (DECISIONS.includes(it.decision) || (it.decision === 'known' && it.recommend))))) fail(`「${it.name}」不需要决定怎么补：${prereqLine(it)}`)
+      setDone(it, d === 'known' && droppedRelated ? 'anchor' : d)
       if (flags.note) it.note = String(flags.note).slice(0, 80)
+      else if (d === 'known') it.note = '后来验证过会了' // 原来的「名额用完没验证」不再成立
       changed.push(it)
     }
     const hints = []
@@ -1587,7 +2536,6 @@ commands.prereq = ({ pos, flags }) => {
     if (!it) { it = { name: nm, role: 'core', reason, cue: null, aliases: [], source: 'gap', answer: null, addedAt: isoLocal() }; s.prereq.items.push(it) }
     it.reason = reason
     it.source = 'gap'
-    s.prereq.batchKind = 'gap'
     setDecide(it, 'inline')
     it.note = lid ? `第 ${lid} 节学到时发现缺` : '课中发现缺'
     if (lid) {
@@ -1629,14 +2577,22 @@ function renderProfile(p) {
   for (const { name, list } of traps.values()) out.push(`带着 ${name} 的习惯犯的错：${list.length} 条（${list.slice(0, 5).join('、')}）`)
   const ms = methodStats()
   if (ms.shown.length) out.push(`教法效果（来自课程记录，跨课程首次检验通过，满 3 节才算；清空画像不会删掉）：${ms.shown.map(([m, v]) => `${METHOD_NAMES[m]} ${v.firstPass}/${v.lessons}`).join('；')}${p.enabled ? '' : '（画像暂停中，不用来给教法建议）'}`)
-  out.push('删一条证据：learn profile forget e<N>；删整个技能：learn profile forget s<N>；暂停：learn profile off；清空：learn profile reset --confirm yes')
-  out.push('删课程不影响画像，删画像不影响课程进度。')
+  out.push('删一条证据：learn profile forget e<N> --name "<技能名>"；删整个技能：learn profile forget s<N> --name "<技能名>"；暂停：learn profile off；清空：learn profile reset --confirm yes')
+  out.push('画像和课程进度互不影响：清空画像不会改动课程进度。')
   return out.join('\n')
 }
 
 commands.profile = ({ pos, flags }) => {
   const sub = pos[0] || 'show'
   if (sub === 'show') return renderProfile(loadProfile())
+  // 开了同步时画像在 git 里：每次改完提交（没开同步时画像不进 git，这里什么也不提交）
+  const r = profileCommand(sub, pos, flags)
+  if (hasRemote()) commitAll(`画像：${sub}${pos[1] ? ` ${pos[1]}` : ''}`)
+  return r
+}
+
+function profileCommand(sub, pos, flags) {
+  const synced = hasRemote() ? '开了同步：同步仓库的历史记录里还留着删之前的版本。' : ''
 
   if (sub === 'add' || sub === 'verify') {
     const nm = checkSkillName(need(pos[1], '技能名'))
@@ -1666,23 +2622,34 @@ commands.profile = ({ pos, flags }) => {
 
   if (sub === 'forget') {
     const id = need(pos[1], 'id（技能 s<N> 或证据 e<N>）')
+    // --name：核对这个 id 确实属于这个技能才删。开了同步时必须给：另一台电脑的记录合进来时编号可能会变
+    const nm = flags.name !== undefined ? String(need(flags.name, '--name 的技能名')).trim() : null
+    if (!nm && hasRemote()) fail(`开了同步，两台电脑的记录合并时编号可能会变。删的时候带上技能名，脚本核对后才删：learn profile forget ${id} --name "<技能名>"`)
     // 删掉的内容也从备份里清掉
     return withProfile((p) => {
-      if (/^s\d+$/.test(id)) {
-        const i = p.skills.findIndex((x) => x.id === id)
-        if (i < 0) fail(`没有技能 ${id}`)
-        const [sk] = p.skills.splice(i, 1)
-        return `画像：已删除技能「${sk.name}」（${id}）和它的 ${sk.evidence.length} 条证据。`
+      const mismatch = (owner) => {
+        const cur = findSkill(p, nm)
+        const now = cur ? `「${cur.name}」现在是 ${cur.id}，证据：${cur.evidence.map((e) => `${e.id}（${EVIDENCE_NAMES[e.type]}：${LEVEL_NAMES[e.level]}，${shortDate(e.at)}）`).join('、')}` : `画像里没有「${nm}」`
+        fail(`${id} ${owner ? `现在是「${owner.name}」的` : '已经不存在'}，不是「${nm}」的（两台电脑的记录合并后编号可能变了），没有删。${now}。核对后用对的 id 再删`)
       }
-      if (/^e\d+$/.test(id)) {
+      const named = (sk) => !nm || skillKeys(sk).includes(canonKey(nm))
+      if (/^s\d+[a-z]*$/.test(id)) {
+        const i = p.skills.findIndex((x) => x.id === id)
+        if (i < 0) { if (nm) mismatch(null); fail(`没有技能 ${id}`) }
+        if (!named(p.skills[i])) mismatch(p.skills[i])
+        const [sk] = p.skills.splice(i, 1)
+        return `画像：已删除技能「${sk.name}」（${id}）和它的 ${sk.evidence.length} 条证据。${synced}`
+      }
+      if (/^e\d+[a-z]*$/.test(id)) {
         const sk = p.skills.find((x) => x.evidence.some((e) => e.id === id))
-        if (!sk) fail(`没有证据 ${id}`)
+        if (!sk) { if (nm) mismatch(null); fail(`没有证据 ${id}`) }
+        if (!named(sk)) mismatch(sk)
         sk.evidence = sk.evidence.filter((e) => e.id !== id)
         if (!sk.evidence.length) {
           p.skills = p.skills.filter((x) => x !== sk)
-          return `画像：已删除 ${id}；「${sk.name}」没有证据了，整条删除。`
+          return `画像：已删除 ${id}；「${sk.name}」没有证据了，整条删除。${synced}`
         }
-        return `画像：已删除 ${id}；「${sk.name}」现在算${levelText(skillLevel(sk))}。`
+        return `画像：已删除 ${id}；「${sk.name}」现在算${levelText(skillLevel(sk))}。${synced}`
       }
       fail('id 格式是 s<N>（整个技能）或 e<N>（一条证据），先 learn profile 看 id')
     }, { purgeBackup: true })
@@ -1696,7 +2663,7 @@ commands.profile = ({ pos, flags }) => {
   }
 
   if (sub === 'reset') {
-    if (flags.confirm !== 'yes') fail('清空不可恢复。先把后果告诉用户（将永久删除画像里的全部技能和证据，课程进度不受影响），用户明确同意后再加 --confirm yes')
+    if (flags.confirm !== 'yes') fail(`清空不可恢复。先把后果告诉用户（将永久删除画像里的全部技能和证据，课程进度不受影响${synced ? '；开了同步：同步仓库的历史记录里还留着清空前的版本' : ''}），用户明确同意后再加 --confirm yes`)
     // 加锁清空；暂停状态保留（用户先说「别用」再说「全删」，之后也不该重新记）
     return withProfileLock(() => {
       const p = loadProfile()
@@ -1704,11 +2671,11 @@ commands.profile = ({ pos, flags }) => {
       const paused = p.enabled === false
       for (const f of [PROFILE, PROFILE_BAK]) fs.rmSync(f, { force: true })
       if (paused) writeJson(PROFILE, { ...emptyProfile(), enabled: false })
-      return `画像：已清空（删除 ${n} 个技能，包括备份）。${paused ? '画像仍是暂停状态（恢复：learn profile on）。' : ''}课程目录里的先修问答记录（选项、档位）不受影响，要删需另外删课程。`
+      return `画像：已清空（删除 ${n} 个技能，包括备份）。${paused ? '画像仍是暂停状态（恢复：learn profile on）。' : ''}${synced}各门课进度里的先修问答记录（选项、档位）不受影响，还留在课程里。`
     })
   }
 
-  fail('用法：learn profile [show] | add <技能> <档> --quote "<用户原话>" | verify <技能> <档> --detail "<题目要点和回答>" | forget <s<N>|e<N>> | off | on | reset --confirm yes')
+  fail('用法：learn profile [show] | add <技能> <档> --quote "<用户原话>" | verify <技能> <档> --detail "<题目要点和回答>" | forget <s<N>|e<N>> --name "<技能名>" | off | on | reset --confirm yes')
 }
 
 // ---------- 工作区线索 ----------
@@ -1821,13 +2788,36 @@ commands.skill = ({ pos, flags }) => {
   fs.mkdirSync(destRoot, { recursive: true })
   const dest = isDir ? path.join(destRoot, skillName) : path.join(destRoot, `${skillName}.md`)
   if (fs.existsSync(dest)) fail(`${dest} 已存在`)
-  fs.cpSync(src, dest, { recursive: true })
+  // 不带版本库目录（.git）：课程目录在学习记录的 git 里，嵌套的 .git 会让 skill 文件同步不过去
+  fs.cpSync(src, dest, { recursive: true, filter: (p) => p === src || (path.basename(p) !== '.git' && !isJunk(path.basename(p))) })
   if (!flags.global) {
     const name = pickCourse(flags)
     saveState(name, loadState(name), `添加课程 skill：${skillName}`)
   }
   return `已添加 skill「${skillName}」到 ${dest}`
 }
+
+// 多台电脑同步：连仓库、看状态、手动拉推、冲突时选边
+commands.sync = ({ flags }) => {
+  if (flags.remote !== undefined) return syncSetup(String(need(flags.remote, '--remote 的仓库地址')).trim())
+  const url = hasRemote()
+  if (!url) return '还没连同步仓库。让用户在 GitHub 上建一个私有仓库，把地址给你，再运行：learn sync --remote <仓库地址>（如 git@github.com:<用户名>/<仓库名>.git）。仓库要用户自己建、这台电脑的 git 要能登录 GitHub。'
+  if (flags.keep !== undefined) return syncKeep(String(flags.keep))
+  syncPull()
+  const st = loadSync()
+  const out = [`同步仓库：${safeUrl(url)}`, ...syncNotes.splice(0)]
+  if (st.conflict) {
+    if (!out.some((x) => x.startsWith('⚠ 同步冲突'))) out.push(conflictText(st.conflict))
+    return out.join('\n')
+  }
+  const why = pushNow({ wait: 35000 })
+  if (why) out.push(`推送：没推上去（${why}）`)
+  else if (!st.pullError) out.push('这台电脑和同步仓库已经一致。')
+  return out.join('\n')
+}
+
+// 后台推送：另一个推送正在进行就排队等它（它只推自己那个提交，不等的话连着几条命令时最后一条会漏推）
+commands._push = ({ pos }) => { pushNow({ sha: pos[0] || null, wait: pos[0] ? 60000 : 0 }); return null }
 
 commands.help = () => `learn —— 学习进度脚本（数据目录：${HOME}）
 
@@ -1839,7 +2829,7 @@ commands.help = () => `learn —— 学习进度脚本（数据目录：${HOME}�
        prereq answer <技能> <A|B|C|D> [--quote "<用户原话>"]
        prereq quiz <技能> <mastered|partial|none> --detail "<题目要点和回答>"
        prereq decide <技能> <learn-first|inline|separate|skip> | prereq decide --all-recommended
-       prereq decide <技能> known               只用于「先单独学一门」的项：画像里已验证会了，解除等待
+       prereq decide <技能> known               待定怎么补或「先单独学一门」的项：画像里已验证会了，改成已会
        prereq gap <技能> --reason "…" [--lesson <节>]   课中发现缺本课以外的技能
        prereq                                   看清单和下一步
 摸底   baseline --json '[{"ability":"…","level":"mastered|partial|none","evidence":"…"}]'
@@ -1855,8 +2845,11 @@ commands.help = () => `learn —— 学习进度脚本（数据目录：${HOME}�
 收尾   pause --summary "<这次学得怎样>" --next "<下次从哪开始>"
 结业   finish --pass|--fail --note "<考核结果>"
 画像   profile | profile add <技能> <档> --quote "<用户原话>" | profile verify <技能> <档> --detail "…"
-       profile forget <s<N>|e<N>> | profile off | profile on | profile reset --confirm yes
+       profile forget <s<N>|e<N>> --name "<技能名>"（开了同步必须带，核对后才删） | profile off | profile on | profile reset --confirm yes
 skill  skill add <路径> --global|--course
+同步   sync --remote <私有仓库地址>             连同步仓库（多台电脑接着学；画像也同步）
+       sync                                     手动拉一次、推一次，看同步状态
+       sync --keep local|remote                 同步冲突时，冲突的课程留哪边（另一边存进备份分支；其他课程和画像照常合并）
 
 教法：${METHODS.join(' / ')}
 JSON 也可以用 --json -（标准输入）或 --file <路径> 传入。
@@ -1864,14 +2857,112 @@ JSON 也可以用 --json -（标准输入）或 --file <路径> 传入。
 
 // ---------- 入口 ----------
 
+const NO_SYNC = new Set(['help', 'sync', '_push'])
+const NO_LOCK = new Set(['help', '_push']) // 后台推送只拿推送锁，只推它启动时的那个提交
+
+function pidAlive(pid) { try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' } }
+
+// 数据目录锁：两个学习窗口同时跑 learn 时排队，合并记录、写进度不会撞在一起。
+// 锁文件里是持有者的进程号：先写好临时文件再硬链接过去，锁从出现起就带着进程号。
+// 持有者已经退出、或锁超过 10 分钟、或内容不是进程号且超过 5 秒，算失效：改名后确认改走的就是读到的那把，再删
+function withDataLock(fn) {
+  fs.mkdirSync(HOME, { recursive: true })
+  const mine = `${process.pid}\n`
+  const tmp = `${DATA_LOCK}.${process.pid}.tmp`
+  const deadline = Date.now() + 60000
+  fs.writeFileSync(tmp, mine)
+  try {
+    for (;;) {
+      try { fs.linkSync(tmp, DATA_LOCK); break } catch (e) {
+        if (e.code !== 'EEXIST') throw e
+        let seen = null
+        let age = 0
+        try { seen = fs.readFileSync(DATA_LOCK, 'utf8'); age = Date.now() - fs.statSync(DATA_LOCK).mtimeMs } catch { continue }
+        const stale = (text, ms) => {
+          const p = /^\d+\n?$/.test(text) ? Number(text) : 0
+          return ms > 600000 || (p > 0 ? !pidAlive(p) : ms > 5000)
+        }
+        if (stale(seen, age)) {
+          // 清理失效的锁要先拿「接管锁」，一次只让一个进程清；清之前再核对一遍还是那把失效的锁，免得删掉别人刚拿到的
+          const tk = `${DATA_LOCK}.takeover.tmp` // .tmp：在 .gitignore 里
+          let fd = null
+          try { fd = fs.openSync(tk, 'wx') } catch (e2) {
+            if (e2.code !== 'EEXIST') throw e2
+            try { if (Date.now() - fs.statSync(tk).mtimeMs > 5000) fs.rmSync(tk, { force: true }) } catch {}
+            sleepMs(20)
+            continue
+          }
+          try {
+            let again = null
+            let age2 = 0
+            try { again = fs.readFileSync(DATA_LOCK, 'utf8'); age2 = Date.now() - fs.statSync(DATA_LOCK).mtimeMs } catch {}
+            if (again !== null && again === seen && stale(again, age2)) fs.rmSync(DATA_LOCK, { force: true })
+          } finally {
+            fs.closeSync(fd)
+            fs.rmSync(tk, { force: true })
+          }
+          continue
+        }
+        if (Date.now() > deadline) fail(`另一个学习窗口正在读写进度，等它做完再试（一直这样的话，删掉 ${DATA_LOCK}）`)
+        sleepMs(100)
+      }
+    }
+  } finally {
+    fs.rmSync(tmp, { force: true })
+  }
+  try {
+    return fn()
+  } finally {
+    try { if (fs.readFileSync(DATA_LOCK, 'utf8') === mine) fs.rmSync(DATA_LOCK, { force: true }) } catch {}
+  }
+}
+
+function shouldPull(cmd) {
+  if (NO_SYNC.has(cmd) || !hasRemote()) return false
+  const st = loadSync()
+  return cmd === 'status' || st.needPull || !st.lastTryAt || hoursSince(st.lastTryAt) * 60 >= (st.pullError ? 30 : PULL_EVERY_MIN)
+}
+
+// 命令跑完：补提交没提交的改动、推到同步仓库、把同步提示放进输出
+function afterCommand(cmd, out) {
+  if (NO_SYNC.has(cmd) || !hasRemote()) return out
+  commitAll(`learn ${cmd}`) // 画像等不经过 saveState 的改动
+  const st = loadSync()
+  const tail = []
+  if (st.conflict) {
+    if (cmd === 'status') { if (!syncNotes.some((x) => x.startsWith('⚠ 同步冲突'))) syncNotes.push(conflictText(st.conflict)) }
+    else if (committed) tail.push('⚠ 同步冲突还没解决，这次的记录只存在这台电脑上。运行 learn sync 看详情，问用户留哪边。')
+  } else if (cmd === 'pause' || cmd === 'finish') {
+    let why = pushNow({ wait: 35000 })
+    // 仓库里有别的电脑新推的：先拉下来合上，再推一次
+    if (why && loadSync().needPull) {
+      syncPull()
+      why = loadSync().conflict ? '和同步仓库里的记录有冲突，运行 learn sync 看详情' : pushNow({ wait: 35000 })
+    }
+    tail.push(why ? `同步：没推上去（${why}）。换电脑之前，先让这台联网运行一次 learn sync。` : '同步：已推到同步仓库，换台电脑也能接着学。')
+  } else if (committed || (cmd === 'status' && needsPush())) {
+    if (cmd === 'status' && st.pushError && !st.needPull) syncNotes.push(`同步：这台有记录还没推上去（上次：${st.pushError}），这次再试。`)
+    startPush()
+  }
+  if (cmd === 'status') return [...syncNotes, out].filter(Boolean).join('\n')
+  return [out, ...syncNotes, ...tail].filter(Boolean).join('\n')
+}
+
 function main() {
   const argv = process.argv.slice(2)
   const cmd = argv[0] || 'help'
   const fn = Object.hasOwn(commands, cmd) ? commands[cmd] : null
   if (!fn) { console.error(`未知命令：${cmd}\n\n${commands.help()}`); process.exit(2) }
   try {
-    if (cmd !== 'help') ensureHome()
-    const out = fn(parseArgs(argv.slice(1)))
+    const args = parseArgs(argv.slice(1))
+    const out = NO_LOCK.has(cmd) ? fn(args) : withDataLock(() => {
+      clearStaleGitLocks()
+      recoverRebase()
+      recoverMerge()
+      ensureHome()
+      if (shouldPull(cmd)) syncPull()
+      return afterCommand(cmd, fn(args))
+    })
     if (out) console.log(out)
     for (const w of warnings) console.log(`⚠ ${w}`)
   } catch (e) {
