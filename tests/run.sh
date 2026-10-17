@@ -240,7 +240,7 @@ L step 1 3 --result r >/dev/null; L step 1 4 --result r >/dev/null
 o=$(L done 1 --fail --note "还是不清" --steps '["补例子","费曼检验"]'); has "已追加 2 步：补例子 → 费曼检验" "$o"; has "连续 2 次未达标" "$o"
 L step 1 5 --result r >/dev/null
 o=$(L start 2 --method coach --criteria x --steps '["a"]'); has "已暂停" "$o"
-L done 2 --pass --note ok2 >/dev/null; o=$(L status); has "已暂停，做完 5/6 步" "$o"; has "加载 skill teach-coach" "$o"; has "接着做：learn start 1，不带 --steps" "$o"
+L done 2 --pass --note ok2 >/dev/null; o=$(L status); has "已暂停，做完 5/6 步" "$o"; has "教法：练习批改，下一步是检验（加载 skill teach-feynman）" "$o"; has "接着做：learn start 1，不带 --steps" "$o"
 o=$(L start 1); has "第 6/6 步：费曼检验" "$o"
 o=$(L done 1 --pass --note ok); o=$(L status); has "最近一次检验（第 1 节，通过）：ok" "$o"
 
@@ -879,14 +879,14 @@ o=$(L split 1 --keep x --criteria c --json '[{"title":"y"}]'); has "第 1 节已
 L start 5 --method worked-example --criteria "说清 axis、预判广播形状、会用 @" --steps '["示范 axis","示范广播","你做 @","费曼检验 + 1 道新题"]' >/dev/null
 o=$(L step 5 1 --result r); hasnt "这是检验那一步" "$o"
 L step 5 2 --result r >/dev/null; L step 5 3 --result r >/dev/null
-o=$(L switch 5 diagnose "反复没懂"); has "第 5 节正在检验（「费曼检验 + 1 道新题」），先把这次检验判完：没过就 learn done 5 --fail" "$o"; has "按诊断纠偏补练没过的那一块" "$o"
+o=$(L switch 5 diagnose "反复没懂"); has "第 5 节正在检验（「费曼检验 + 1 道新题」），先把这次检验判完。" "$o"; has "检验没过的：learn done 5 --fail --note" "$o"; has "按诊断纠偏补练没过的那一块" "$o"
 o=$(J np 's.lessons[1].method+"|"+s.lessons[1].methodHistory.length'); [ "$o" = '"worked-example|1"' ] && ok || bad "检验中被拒的换教法不该改记录" "$o"
 L mistake 5 "(5,) 是一列" "一维不分行列" >/dev/null
 o=$(L done 5 --fail --note "广播没过：(3,) 当成按行配"); has "针对没过的那一项继续练。如果达标标准里其余几项都做对了、只卡在一块：用 learn split 5" "$o"; hasnt "已经换过" "$o"
-o=$(L switch 5 diagnose "反复没懂"); has "加载 skill teach-diagnose" "$o"; has "一节最多换一次教法：这一节之后用这一种讲完；再卡住就用 learn split 5" "$o"; has "剩下的 2 步是按示范例题拆的" "$o"
+o=$(L switch 5 diagnose "反复没懂"); has "加载 skill teach-diagnose" "$o"; has "一节最多换一次教法（用户说换种方式、换个讲法，或说乱、烦、算了时例外：直接换成示范例题，learn switch 5 worked-example" "$o"; has "：这一节之后用这一种讲完；再卡住就用 learn split 5" "$o"; has "剩下的 2 步是按示范例题拆的" "$o"
 o=$(L status); has "本节已经换过 1 次教法（示范例题 → 诊断纠偏）：一节最多换一次，不要再换" "$o"
-o=$(L switch 5 diagnose "重拆" --steps '["诊断题","费曼检验"]'); hasnt "一节最多换一次教法：这一节之后" "$o"; has "加载 skill teach-diagnose" "$o"
-o=$(L switch 5 coach "用户要背口诀"); has "这一节已经换过 2 次教法（示范例题 → 诊断纠偏 → 练习批改）" "$o"; has "不要再换" "$o"
+o=$(L switch 5 diagnose "重拆" --steps '["诊断题","费曼检验"]'); hasnt "一节最多换一次教法" "$o"; has "加载 skill teach-diagnose" "$o"
+o=$(L switch 5 coach "用户要背口诀"); has "这一节已经换过 2 次教法（示范例题 → 诊断纠偏 → 练习批改）" "$o"; has "不要再换（用户说换种方式、换个讲法，或说乱、烦、算了时例外：直接换成示范例题" "$o"
 o=$(J np 's.lessons[1].switches'); [ "$o" = 2 ] && ok || bad "换教法次数不对" "$o"
 L step 5 5 --result r >/dev/null
 o=$(L step 5 6 --result r); has "这是检验那一步" "$o"
@@ -1014,6 +1014,101 @@ L init q2 --title Q2 >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null
 L pause --summary s --next n --question "摸底第 2 题：x = [1, 2]，print(x * 2) 输出什么？" >/dev/null
 o=$(L status); has "状态：还没出计划" "$o"; has "摸底第 2 题：x = [1, 2]，print(x * 2) 输出什么？" "$o"
 o=$(L help); has "[--question -]   --question - 从标准输入读那道还没答的题" "$o"
+
+# T34 用户说「换种方式」：不问、不让挑，直接换成示范例题；用户要求的换（--user）不算进「一节最多换一次」；检验中途停下（--stopped）不算连续未达标
+fresh T34
+L init w --title W >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L set-plan --json '[{"id":1,"title":"广播"}]' >/dev/null
+L start 1 --method coach --criteria c --steps '["练","再练","费曼检验"]' >/dev/null; L step 1 1 --result r >/dev/null
+CMD='learn switch 1 worked-example "用户说换" --user --steps '\''["示范：<卡住的那块>（完整代码和输出）","补全题","独立题","费曼检验"]'\'
+NAMED='用户点名要别的教法就换成点名的那种，也加 --user，步骤按它拆，加载它的 skill'
+EX="（用户说换种方式、换个讲法，或说乱、烦、算了时例外：直接换成示范例题，${CMD}，不问换什么；${NAMED}）"
+EXW="（用户说换种方式、换个讲法，或说乱、烦、算了也不换教法：退回示范这一档重讲卡住的那块，${CMD}，不问换什么；${NAMED}）"
+o=$(L switch 1 diagnose "练了两次都错" --steps '["诊断题","费曼检验"]'); has "一节最多换一次教法${EX}：这一节之后用这一种讲完" "$o"
+o=$(L status); has "本节已经换过 1 次教法（练习批改 → 诊断纠偏）：一节最多换一次，不要再换${EX}，用现在这种讲完" "$o"
+o=$(L done 1 --fail --note "诊断题没过"); has "这一节已经换过 1 次教法（练习批改 → 诊断纠偏），不要再换${EX}。" "$o"
+# 用户说换：不算进上限，不再提示「一节最多换一次」「做法一直变」
+o=$(L switch 1 worked-example "用户说换" --user --steps '["示范：广播（完整代码和输出）","补全题","独立题","费曼检验"]'); has "已换成示范例题。加载 skill teach-worked-example" "$o"; has "用户要求换的，不算进「一节最多换一次」：这一节剩下的都按示范例题讲完，不换回去" "$o"; hasnt "做法一直变" "$o"; hasnt "一节最多换一次教法（" "$o"
+has "第 2/5 步：示范：广播（完整代码和输出）" "$o"
+o=$(J w 's.lessons[0].switches+"|"+s.lessons[0].userSwitches'); [ "$o" = '"1|1"' ] && ok || bad "用户要求的换不该算进 switches" "$o"
+has "（用户要求）" "$(cat $LEARN_HOME/w/log.md)"
+o=$(L status); has "本节已经换过 1 次教法，另有 1 次是用户要求换的（练习批改 → 诊断纠偏 → 示范例题）：一节最多换一次，不要再换${EXW}，用现在这种讲完" "$o"; hasnt "例外：直接换成示范例题" "$o"
+# 已经是示范例题、做到补全题时说换：同样重拆、退回示范，不算换教法
+L step 1 2 --result r >/dev/null
+o=$(L switch 1 worked-example "用户说换" --user --steps '["示范：更小的一块（完整代码和输出）","补全题","独立题","费曼检验"]'); has "第 3/6 步：示范：更小的一块（完整代码和输出）" "$o"; hasnt "用户要求换的" "$o"; hasnt "做法一直变" "$o"
+o=$(J w 's.lessons[0].switches+"|"+s.lessons[0].userSwitches'); [ "$o" = '"1|1"' ] && ok || bad "同一教法重拆不该加次数" "$o"
+o=$(L done 1 --fail --note "补全题没过"); has "不要再换${EXW}。" "$o"
+# 只有用户要求换过：status 提醒按现在这种讲完；点名换别的教法也加 --user
+L init wn --title WN >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L set-plan --json '[{"id":1,"title":"a"}]' >/dev/null
+L start 1 --method diagnose --criteria c --steps '["诊断题","费曼检验"]' >/dev/null
+o=$(L switch 1 coach "用户点名要练习" --user --steps '["练","费曼检验"]'); has "用户要求换的，不算进「一节最多换一次」：这一节剩下的都按练习批改讲完" "$o"
+o=$(J wn 's.lessons[0].switches+"|"+s.lessons[0].userSwitches'); [ "$o" = '"0|1"' ] && ok || bad "点名换的不该算进 switches" "$o"
+o=$(L status); has "本节用户要求换过 1 次教法（诊断纠偏 → 练习批改）：按现在这种讲完，不换回去（用户说换种方式" "$o"; hasnt "本节已经换过" "$o"
+L step 1 1 --result r >/dev/null; L done 1 --pass --note ok >/dev/null; L review --lesson 1 --reason "忘了" >/dev/null; L start 1 --method diagnose --steps '["探","费曼检验"]' >/dev/null
+o=$(J wn 's.lessons[0].switches+"|"+s.lessons[0].userSwitches'); [ "$o" = '"0|0"' ] && ok || bad "复习重开该清零 userSwitches" "$o"
+# 检验那一步：status 指向 teach-feynman，例外命令先记中途停下；直接 switch（同教法重拆也算）被拒时给出同样的路
+L init w2 --title W2 >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L set-plan --json '[{"id":1,"title":"axis"}]' >/dev/null
+L start 1 --method coach --criteria "方向、形状" --steps '["练","费曼检验"]' >/dev/null
+L switch 1 diagnose "练了两次都错" --steps '["诊断题","费曼检验"]' >/dev/null; L step 1 1 --result r >/dev/null
+o=$(L status); has "教法：诊断纠偏，这一步是检验（加载 skill teach-feynman）" "$o"; hasnt "加载 skill teach-diagnose" "$o"; has '不要再换（用户说换种方式、换个讲法，或说乱、烦、算了时例外：直接换成示范例题，先 learn done 1 --fail --stopped --note "…"，再 learn switch 1 worked-example "用户说换" --user --steps' "$o"
+o=$(L switch 1 worked-example "用户说换" --user); has "第 1 节正在检验" "$o"; has '用户说换种方式的：learn done 1 --fail --stopped --note "…"，再 learn switch 1 worked-example "用户说换" --user --steps' "$o"; has "不用 --force；${NAMED}" "$o"
+o=$(L switch 1 diagnose "重拆" --steps '["诊断题","费曼检验"]'); has "第 1 节正在检验" "$o"
+o=$(L done 1 --fail --note "形状没过"); has "未达标" "$o"
+L step 1 3 --result r >/dev/null
+o=$(L done 1 --pass --stopped --note x); has "--stopped 只和 --fail 一起用" "$o"
+o=$(L done 1 --fail --stopped --note "方向过了；形状没问；用户说：算了，换个讲法"); has "已记为检验中途停下（不算一次完整检验，也不算进「连续 2 次未达标」）" "$o"; hasnt "已连续 2 次未达标" "$o"; hasnt "learn split" "$o"; has "已追加 4 步：示范：卡住的那块（完整代码和输出） → 补全题 → 独立题 → 费曼检验" "$o"; hasnt "补练没过的那一项" "$o"; has "下一步：${CMD/learn switch 1/learn switch 1}" "$o"; has "${NAMED}" "$o"
+has "检验中途停下（用户说换）" "$(cat $LEARN_HOME/w2/log.md)"
+o=$(J w2 's.lessons[0].attempts'); [ "$o" = 1 ] && ok || bad "中途停下不该算一次检验" "$o"
+o=$(L status); has "本节上次检验（中途停下，没判完）：方向过了" "$o"
+o=$(L switch 1 worked-example "用户说换" --user --steps '["示范：形状（完整代码和输出）","补全题","独立题","费曼检验"]'); has "已换成示范例题" "$o"; hasnt "正在检验" "$o"; has "用户要求换的" "$o"; hasnt "剩下的 4 步是按" "$o"
+L step 1 6 --result r >/dev/null; L step 1 7 --result r >/dev/null; L step 1 8 --result r >/dev/null
+o=$(L done 1 --fail --note "形状还是没过"); has "已连续 2 次未达标" "$o"
+# 只有一次中途停下 + 一次真没过：不算连续 2 次
+L init w4 --title W4 >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L set-plan --json '[{"id":1,"title":"a"}]' >/dev/null
+L start 1 --method worked-example --criteria c --steps '["示范","费曼检验"]' >/dev/null; L step 1 1 --result r >/dev/null
+L done 1 --fail --stopped --note "用户说换" >/dev/null
+for k in 3 4 5; do L step 1 $k --result r >/dev/null; done
+o=$(L done 1 --fail --note "真没过"); has "未达标" "$o"; hasnt "已连续 2 次未达标" "$o"
+# 中途停下的首次检验不算教法首次通过率
+L init w5 --title W5 >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L set-plan --json '[{"id":1,"title":"a"},{"id":2,"title":"b"},{"id":3,"title":"c"}]' >/dev/null
+for k in 1 2 3; do L start $k --method worked-example --criteria c --steps '["示范","费曼检验"]' >/dev/null; L step $k 1 --result r >/dev/null; L done $k --fail --stopped --note "用户说换" >/dev/null; L done $k --pass --note ok >/dev/null; done
+# w5 三节首次是中途停下、之后都过了，算 3 次首次通过；w4 那节首次真检验没过（不算停下那次），所以是 3/4
+o=$(L profile); has "示范例题 3/4" "$o"
+# 暂停在检验那一步的节：status 也指向 teach-feynman
+L init w6 --title W6 >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L set-plan --json '[{"id":1,"title":"a"},{"id":2,"title":"b"}]' >/dev/null
+L start 1 --method coach --criteria c --steps '["练","费曼检验"]' >/dev/null; L step 1 1 --result r >/dev/null
+L start 2 --method coach --criteria c --steps '["练","费曼检验"]' --force yes >/dev/null; L step 2 1 --result r >/dev/null; L done 2 --pass --note ok >/dev/null
+o=$(L status); has "已暂停，做完 1/2 步，教法：练习批改，下一步是检验（加载 skill teach-feynman）" "$o"
+# 换教法清掉上次没答完的题；直接检验的提示写明用户说换时不再问要不要学；只有中途停下的检验不放出挪过去的错题
+L init w3 --title W3 >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L set-plan --json '[{"id":1,"title":"a"},{"id":2,"title":"b"}]' >/dev/null
+L start 1 --method coach --criteria c --steps '["练","费曼检验"]' >/dev/null
+L pause --summary s --next n --question "q1" >/dev/null
+o=$(L status); has "上次没答完的题" "$o"
+L switch 1 worked-example "用户说换" --user --steps '["示范：a","补全题","独立题","费曼检验"]' >/dev/null
+o=$(L status); hasnt "上次没答完的题" "$o"
+L mistake 1 "错" "对" >/dev/null; L mistake m1 --to 2 >/dev/null
+o=$(L check 2); has "检验中用户说换种方式：不再问下一项、也不问要不要学，learn done 2 --fail --stopped" "$o"; has "${NAMED}" "$o"
+o=$(L status); has "这一步是检验（加载 skill teach-feynman）" "$o"
+L done 2 --fail --stopped --note "用户说换" >/dev/null
+node -e "const f=process.env.LEARN_HOME+'/w3/state.json';const s=require(f);s.mistakes[0].due='$TODAY';require('fs').writeFileSync(f,JSON.stringify(s))"
+o=$(L due); hasnt "m1" "$o"
+L done 2 --fail --note "真的没过" >/dev/null
+o=$(L due); has "m1" "$o"
+o=$(L help); has "[--stopped]" "$o"; has "用户说换种方式、点名要某种教法时加 --user" "$o"
+# 规则写进了人设和 skill
+R=$(cd "$(dirname "$P")/.." && pwd)
+has "讲课时用户说换种方式、换个讲法，或说乱、烦、算了（想停的按累，点名教法的照点名）：是没讲通、耐心快没了。不问换什么、不给选项" "$(cat "$R/cordis.patch.yml")"
+o=$(cat "$R/skills/learn-plan/SKILL.md"); hasnt "给 2-3 种做法让用户选" "$o"; has 'learn switch <节> worked-example "用户说换" --user --steps' "$o"; has '`learn switch <节> <点名的教法> "用户点名" --user' "$o"
+o=$(cat "$R/skills/teach-worked-example/SKILL.md"); has "**用户说换**（换种方式、换个讲法，或说乱、烦、算了；话里说了今天到这、不学了、歇会儿的" "$o"; has "「先到这，下次再说」" "$o"; has "同一块连续 2 次说没看懂（这一轮没说换）" "$o"; has "任何一步里用户说换，都按第 1 步末尾的「用户说换」做" "$o"
+has "learn done <节> --fail --stopped" "$(cat "$R/skills/teach-feynman/SKILL.md")"
+for f in teach-diagnose teach-coach teach-first-principles; do has "**用户说换优先：**" "$(cat "$R/skills/$f/SKILL.md")"; done
+o=$(cat "$R/skills/learn-review/SKILL.md"); has "当前步是检验时 status 写的是 \`teach-feynman\`" "$o"; has "想停的（今天到这、不学了、歇会儿）先问要不要停" "$o"
 
 ROOT=$(cd "$(dirname "$P")/.." && pwd)
 o=$(node -e '

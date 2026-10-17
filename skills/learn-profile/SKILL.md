@@ -18,7 +18,7 @@ description: 学习教练流程：查看、纠正、删除、暂停、清空学�
 | 用户说 | 做法 |
 |---|---|
 | 「我其实不会 X」「X 我只会一点」（比记录低） | 直接采信：`learn profile add "X" <none|partial> --quote "<用户原话>"` |
-| 「我会 X」（比记录高，或没有记录） | 先出 1 道验证题（预测输出 / 找错 / 解释为什么）。答对并说出原因：`learn profile verify "X" mastered --detail "<题目要点和回答>"`；答对说不出原因记 partial；答错记 none，并用一句话说这题暴露了什么 |
+| 「我会 X」（比记录高，或没有记录） | 先出 1 道验证题（预测输出 / 找错 / 解释为什么；用选择题时选项和说明不能暗示答案）。答对并说出原因：`learn profile verify "X" mastered --detail "<题目要点和回答>"`；答对说不出原因记 partial；答错记 none，并用一句话说这题暴露了什么 |
 | 「删掉这条」（刚收到回执时） | 照回执里的命令：`learn profile forget e<N> --name "X"` |
 | 「别记 X 了」 | `learn profile forget s<N> --name "X"`（整个技能，先 `learn profile` 查 id） |
 
