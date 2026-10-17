@@ -983,6 +983,38 @@ L done 2 --fail --note "没过" >/dev/null
 o=$(L mistake m2 --to 2); has "已把 m2 从第 1 节挪到第 2 节「b」。" "$o"; hasnt "检验过一次以后" "$o"
 o=$(J e 's.mistakes[1].wait===undefined'); [ "$o" = true ] && ok || bad "挪到检验过的节不该等" "$o"
 
+# T33 先写预测再运行；收尾时记下没答完的题，下次开场先答
+fresh T33
+L init q --title Q >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L set-plan --json '[{"id":1,"title":"广播"}]' >/dev/null
+L start 1 --method worked-example --criteria c --steps '["示范","补全题","费曼检验"]' >/dev/null
+o=$(L step 1 1 --result r); has "题目只考讲过的：让用户先写预测（考什么写什么：输出、形状或会不会报错），再用 bash 跑出来对，不一样再问错在哪一步" "$o"
+o=$(L pause --summary s --next n --question "  "); has "--question 写那道还没答的题，原样写全" "$o"
+o=$(J q 's.sessions[s.sessions.length-1].closed'); [ "$o" = false ] && ok || bad "--question 是空的不该收尾" "$o"
+# 题里有反引号、双引号、$：从标准输入传，原样存下
+o=$(L pause --summary "补全题做到一半" --next "接着做补全题" --question - <<'QEOF'
+已知 `a = np.zeros((4, 3))`，`b = np.arange(3)`，print("a + b") 之前先写 $预测：
+(a + b).shape 是什么，会不会报错？
+QEOF
+); has "开场先把那道没答完的题贴出来让用户答" "$o"
+o=$(L status); has "上次说好的下次起点：接着做补全题" "$o"; has "上次没答完的题（开场先把它原样贴出来、放在回复最后，用户先答这道，再处理疑问和复习；答完照平常记，记过就不再显示）：" "$o"; has '已知 `a = np.zeros((4, 3))`，`b = np.arange(3)`，print("a + b") 之前先写 $预测：' "$o"; has "(a + b).shape 是什么，会不会报错？" "$o"
+has "留了一道没答完的题" "$(cat $LEARN_HOME/q/log.md)"
+# 收尾后又问了一句、又收尾一次：题还在
+L ask "广播是什么意思" >/dev/null
+o=$(L status); has "上次没答完的题" "$o"
+L pause --summary s2 --next n2 >/dev/null
+o=$(L status); has "(a + b).shape 是什么，会不会报错？" "$o"
+# 记了步骤才清掉
+L step 1 2 --result "答对了 (4, 3)" >/dev/null
+o=$(L status); hasnt "上次没答完的题" "$o"
+L pause --summary s3 --next n3 --question "q2" >/dev/null; L mistake 1 "错" "对" >/dev/null
+o=$(L status); hasnt "上次没答完的题" "$o"
+# 还没出计划时也显示
+L init q2 --title Q2 >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null
+L pause --summary s --next n --question "摸底第 2 题：x = [1, 2]，print(x * 2) 输出什么？" >/dev/null
+o=$(L status); has "状态：还没出计划" "$o"; has "摸底第 2 题：x = [1, 2]，print(x * 2) 输出什么？" "$o"
+o=$(L help); has "[--question -]   --question - 从标准输入读那道还没答的题" "$o"
+
 ROOT=$(cd "$(dirname "$P")/.." && pwd)
 o=$(node -e '
 const fs=require("fs"),r=process.argv[1]

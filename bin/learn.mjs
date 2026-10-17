@@ -2054,9 +2054,10 @@ const methodTrail = (l) => (l.methodHistory || []).slice(-(switchCount(l) + 1)).
 const multiPart = (c) => String(c || '').split(/[、；;]/).filter((x) => x.trim()).length >= 2
 const SPLIT_TIP = (id) => `用 learn split ${id} 把卡住的那块拆成单独一节（接在本节后面学），本节只检验已经做对的部分`
 const switchedText = (l) => `这一节已经换过 ${switchCount(l)} 次教法（${methodTrail(l)}）`
+const pendingLine = (s) => (s.pendingQuestion ? `上次没答完的题（开场先把它原样贴出来、放在回复最后，用户先答这道，再处理疑问和复习；答完照平常记，记过就不再显示）：\n${s.pendingQuestion.text}` : null)
 
 // 示范例题的节：进入讲解或练习的一步时提醒先讲后问（检验那一步不提醒）
-const TEACH_FIRST = '（给教练看，不用转告）这一步如果要用到没讲过的东西（新函数、新写法、新规则，或讲过的东西的新情况）：这一轮只讲，先具体例子，再用 bash 跑出来的完整代码和输出，最后讲规律；讲完只问看懂没有，不出题。用户说看懂了，下一轮再出题，题目只考讲过的。'
+const TEACH_FIRST = '（给教练看，不用转告）这一步如果要用到没讲过的东西（新函数、新写法、新规则，或讲过的东西的新情况）：这一轮只讲，先具体例子，再用 bash 跑出来的完整代码和输出，最后讲规律；讲完只问看懂没有，不出题。用户说看懂了，下一轮再出题，题目只考讲过的：让用户先写预测（考什么写什么：输出、形状或会不会报错），再用 bash 跑出来对，不一样再问错在哪一步。'
 function teachFirstTip(l) {
   if (l.method !== 'worked-example' || l.status !== 'in_progress') return null
   const i = l.steps.findIndex((x) => x.status !== 'done')
@@ -2078,6 +2079,7 @@ commands.step = ({ pos, flags }) => {
   need(flags.result, '--result（这一步的结果：做对了什么、错在哪）')
   st.status = status
   st.result = flags.result
+  delete s.pendingQuestion
   if (status === 'done') {
     const nx = l.steps.find((x) => x.status === 'todo')
     if (nx && !l.steps.some((x) => x.status === 'in_progress')) nx.status = 'in_progress'
@@ -2122,6 +2124,7 @@ commands.check = ({ pos, flags }) => {
   l.status = 'in_progress'
   l.forced = unmet.length > 0
   l.directCheck = true
+  delete s.pendingQuestion
   saveState(name, s, `第 ${l.id} 节跳过讲解，直接检验：${reason}`)
   extra.push(`已跳到检验。过了就算掌握（learn done ${l.id} --pass --note "…"）；没过（learn done ${l.id} --fail --note "…"）就告诉用户哪里没过，问要不要学这一节：要学就 learn start ${l.id} --steps '[…]' --force yes 重新拆步骤，不学就按 done 追加的补练步骤只补没过的那一项。`)
   return `${extra.join('\n')}\n${positionLine(s)}`
@@ -2239,6 +2242,7 @@ commands.done = ({ pos, flags }) => {
   const note = need(flags.note, '--note（检验证据：做对了哪道题、费曼判分各项结果）')
   const remedy = flags.fail && flags.steps ? parseSteps(flags.steps) : null
   l.attempts += 1
+  delete s.pendingQuestion
   // 跳过讲解直接检验的这一次检验记在检验记录上：教法统计不算它（跟教法无关）
   l.notes.push({ at: isoLocal(), pass: !!flags.pass, note, method: l.method, ...(l.directCheck ? { direct: true } : {}) })
   delete l.directCheck
@@ -2357,6 +2361,7 @@ commands.mistake = ({ pos, flags }) => {
     if (!sk && !it) fromNote = `「${raw}」不在画像和先修清单里，确认是用户会的技能。`
   }
   s.mistakes.push({ id, lesson: l.id, wrong, right, from, stage: 0, due: addDays(dateLocal(), INTERVALS[0]), graduated: false, createdAt: isoLocal() })
+  delete s.pendingQuestion
   saveState(name, s, `记错题 ${id}（第 ${l.id} 节${from ? `，来自 ${from} 的习惯` : ''}）：${wrong}`)
   return `已记为 ${id}${from ? `（来自 ${from} 的习惯）` : ''}，${addDays(dateLocal(), INTERVALS[0])} 复习。${fromNote}`
 }
@@ -2399,10 +2404,17 @@ commands.pause = ({ flags }) => {
   const sess = touchSession(s)
   sess.summary = need(flags.summary, '--summary（这次学得怎么样）')
   sess.nextStart = need(flags.next, '--next（下次从哪开始）')
+  // 出了题用户还没答：原题记在课程上，下次开场先贴出来让用户答（回来最容易卡在离开前没解决的那一步）。
+  // 记到下一次 step / done / mistake / check 为止，中间再收尾、问问题都不丢
+  if (flags.question !== undefined) {
+    const q = (flags.question === '-' ? fs.readFileSync(0, 'utf8') : String(flags.question)).trim()
+    if (!q) fail('--question 写那道还没答的题，原样写全（代码、形状、条件都带上）；题里有代码、引号就用 --question - 从标准输入传。没有没答完的题就不加 --question')
+    s.pendingQuestion = { text: q, at: isoLocal() }
+  }
   sess.end = isoLocal()
   sess.closed = true
-  saveState(name, s, `收尾：${sess.summary}；下次：${sess.nextStart}`, { session: false })
-  return '已记录本次学习。下次打开会从这里接上。'
+  saveState(name, s, `收尾：${sess.summary}；下次：${sess.nextStart}${flags.question !== undefined ? '；留了一道没答完的题' : ''}`, { session: false })
+  return `已记录本次学习。下次打开会从这里接上${s.pendingQuestion ? '，开场先把那道没答完的题贴出来让用户答' : ''}。`
 }
 
 commands.finish = ({ flags }) => {
@@ -2453,7 +2465,7 @@ commands.status = ({ flags }) => {
     return `${n}（${ago === 0 ? '今天学过' : `${ago} 天没学`}${wait.length ? `，在等先修 ${wait.join('、')}` : ''}）`
   })
   out.push(`当前课程：${name}「${s.title}」${others.length ? `（另有：${others.join('、')}）` : ''}`)
-  if (!s.goal) { out.push(`状态：还没立目标。下一步：${nextSetupStep(s)}`); return out.join('\n') }
+  if (!s.goal) { out.push(`状态：还没立目标。下一步：${nextSetupStep(s)}`); if (pendingLine(s)) out.push(pendingLine(s)); return out.join('\n') }
   const goalNotes = [s.goal.deadline && `期限 ${s.goal.deadline}`, s.goal.minutesPerSession && `每次约 ${s.goal.minutesPerSession} 分钟，快到时收尾`].filter(Boolean)
   out.push(`目标：${s.goal.exam}${goalNotes.length ? `（${goalNotes.join('；')}）` : ''}`)
   if (!s.lessons.length) {
@@ -2461,6 +2473,7 @@ commands.status = ({ flags }) => {
     if (s.baseline.length) out.push(`摸底：${s.baseline.map((b) => `${b.ability}=${b.level}`).join('，')}`)
     if (waitingItems(s).length) out.push(`等待先修：${waitingItems(s).map((x) => x.name).join('、')}（用户选了先单独学一门，学完再回来）`)
     out.push(`状态：还没出计划。下一步：${nextSetupStep(s)}`)
+    if (pendingLine(s)) out.push(pendingLine(s))
     return out.join('\n')
   }
   if (s.finished) { out.push(`已于 ${s.finishedAt.slice(0, 10)} 结业。`); return out.join('\n') }
@@ -2530,6 +2543,7 @@ commands.status = ({ flags }) => {
     if (ago >= 14) out.push(`⚠ 已经 ${ago} 天没学：先快速摸底已掌握的节，测不过的标为需复习`)
   }
 
+  if (pendingLine(s)) out.push(pendingLine(s))
   const open = s.questions.filter((q) => q.status === 'open')
   if (open.length) {
     out.push('未解决的疑问：')
@@ -3081,7 +3095,7 @@ commands.help = () => `learn —— 学习进度脚本（数据目录：${HOME}�
 错题   mistake <节> "<错误理解>" "<正确理解>" [--from <带来误解的已会技能>] | due | review <mid> --pass|--fail
        mistake <mid> --to <节>   错题挪到别的节（拆节后挪给拆出去的那节，那节检验过一次后才复习）
        review --lesson <节> [--reason "…"]   把一节标为需复习
-收尾   pause --summary "<这次学得怎样>" --next "<下次从哪开始>"
+收尾   pause --summary "<这次学得怎样>" --next "<下次从哪开始>" [--question -]   --question - 从标准输入读那道还没答的题（原样写全）
 结业   finish --pass|--fail --note "<考核结果>"
 画像   profile | profile add <技能> <档> --quote "<用户原话>" | profile verify <技能> <档> --detail "…"
        profile forget <s<N>|e<N>> --name "<技能名>"（开了同步必须带，核对后才删） | profile off | profile on | profile reset --confirm yes
