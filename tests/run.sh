@@ -868,6 +868,76 @@ L step 1 4 --result r >/dev/null
 o=$(L switch 1 coach "做完了再换"); has "步骤都做完了：先 learn done 1" "$o"; hasnt "按它的做法接着教" "$o"
 L done 1 --pass --note ok >/dev/null; L review --lesson 1 --reason "忘了" >/dev/null
 o=$(L status); hasnt "摸底（细化这节" "$o"
+# T32 一节太大、来回换教法：检验中不许换教法；一节最多换一次；只卡一块就拆节
+fresh T32
+L init np --title N >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L set-plan --json '[{"id":1,"title":"数组"},{"id":5,"title":"axis、广播、矩阵乘法","requires":[1]},{"id":6,"title":"导数","requires":[5]},{"id":7,"title":"链式","requires":[6]}]' >/dev/null
+L start 1 --method coach --criteria c --steps '["练","费曼检验"]' >/dev/null; L step 1 1 --result r >/dev/null
+o=$(L step 1 2 --result r); has "这是检验那一步，记完就判：learn done 1 --pass|--fail" "$o"
+L done 1 --pass --note ok >/dev/null
+o=$(L split 1 --keep x --criteria c --json '[{"title":"y"}]'); has "第 1 节已经已掌握，不用拆" "$o"
+L start 5 --method worked-example --criteria "说清 axis、预判广播形状、会用 @" --steps '["示范 axis","示范广播","你做 @","费曼检验 + 1 道新题"]' >/dev/null
+o=$(L step 5 1 --result r); hasnt "这是检验那一步" "$o"
+L step 5 2 --result r >/dev/null; L step 5 3 --result r >/dev/null
+o=$(L switch 5 diagnose "反复没懂"); has "第 5 节正在检验（「费曼检验 + 1 道新题」），先把这次检验判完：没过就 learn done 5 --fail" "$o"; has "按诊断纠偏补练没过的那一块" "$o"
+o=$(J np 's.lessons[1].method+"|"+s.lessons[1].methodHistory.length'); [ "$o" = '"worked-example|1"' ] && ok || bad "检验中被拒的换教法不该改记录" "$o"
+L mistake 5 "(5,) 是一列" "一维不分行列" >/dev/null
+o=$(L done 5 --fail --note "广播没过：(3,) 当成按行配"); has "针对没过的那一项继续练。如果达标标准里其余几项都做对了、只卡在一块：用 learn split 5" "$o"; hasnt "已经换过" "$o"
+o=$(L switch 5 diagnose "反复没懂"); has "加载 skill teach-diagnose" "$o"; has "一节最多换一次教法：这一节之后用这一种讲完；再卡住就用 learn split 5" "$o"; has "剩下的 2 步是按示范例题拆的" "$o"
+o=$(L status); has "本节已经换过 1 次教法（示范例题 → 诊断纠偏）：一节最多换一次，不要再换" "$o"
+o=$(L switch 5 diagnose "重拆" --steps '["诊断题","费曼检验"]'); hasnt "一节最多换一次教法：这一节之后" "$o"; has "加载 skill teach-diagnose" "$o"
+o=$(L switch 5 coach "用户要背口诀"); has "这一节已经换过 2 次教法（示范例题 → 诊断纠偏 → 练习批改）" "$o"; has "不要再换" "$o"
+o=$(J np 's.lessons[1].switches'); [ "$o" = 2 ] && ok || bad "换教法次数不对" "$o"
+L step 5 5 --result r >/dev/null
+o=$(L step 5 6 --result r); has "这是检验那一步" "$o"
+o=$(L done 5 --fail --note "还是没过"); has "已连续 2 次未达标" "$o"; has "如果达标标准里其余几项都做对了" "$o"; has "这一节已经换过 2 次教法" "$o"; hasnt "整节都没掌握：换教法" "$o"
+o=$(L split 5 --json '[{"title":"广播"}]'); has "缺少--keep" "$o"
+o=$(L split 5 --keep "  " --criteria a --json '[{"title":"广播"}]'); has "--keep 不能是空的" "$o"
+o=$(L split 5 --keep axis --json '[{"title":"广播"}]'); has "原来的达标标准还包括要拆出去的部分" "$o"
+o=$(L split 5 --keep axis --criteria a --json '[{"summary":"无标题"}]'); has "每项要有 title" "$o"
+o=$(L split 5 --keep axis --criteria a --json '[{"title":"广播"}]'); has "还有没做完的讲解或练习步骤（「补练没过的那一项」）：加 --steps" "$o"; has "只差检验，就写 --steps '[\"检验：只考「axis」\"]'" "$o"
+o=$(L split 5 --keep axis --criteria "说清 axis=0/1 的方向" --json '[{"title":"广播","summary":"(3,) 当成按行配"},{"title":"矩阵乘法 @"}]' --steps '["检验：只考 axis"]')
+has "已拆开：第 5 节只留「axis」，达标标准改成：说清 axis=0/1 的方向。新加 第 8 节「广播」 → 第 9 节「矩阵乘法 @」" "$o"; has "原来跟在第 5 节后面的第 6 节，改成等第 9 节学完。" "$o"; has "第 5 节接着做剩下的步骤，只讲、只考「axis」" "$o"; has "learn start 8" "$o"
+has "📍 第 5 节「axis」 · 第 7/7 步：检验：只考 axis · 这是最后一步" "$o"
+o=$(J np 's.lessons.map(l=>l.id+":"+l.requires.join("+")).join(",")'); [ "$o" = '"1:,5:1,8:5,9:8,6:5+9,7:6"' ] && ok || bad "拆节后的顺序和前置不对" "$o"
+o=$(J np '[s.lessons.find(l=>l.id===8).summary,s.lessons.find(l=>l.id===8).splitOf,s.lessons.find(l=>l.id===5).split.into.join("+"),s.lessons.find(l=>l.id===5).split.notes].join("|")'); [ "$o" = '"(3,) 当成按行配|5|8+9|2"' ] && ok || bad "拆节记录不对" "$o"
+o=$(L status); has "本节是从「axis、广播、矩阵乘法」拆出来的：「广播」移到第 8 节，「矩阵乘法 @」移到第 9 节。这节只讲、只考「axis」" "$o"
+# 拆完以后的第一次没过，不算「连续 2 次」
+L step 5 7 --result r >/dev/null
+o=$(L done 5 --fail --note "axis 方向说反"); has "未达标" "$o"; hasnt "已连续 2 次未达标" "$o"
+L step 5 8 --result r >/dev/null; L step 5 9 --result r >/dev/null; L done 5 --pass --note ok >/dev/null
+o=$(L status); has "当前第 8 节「广播」" "$o"; has "本节是从第 5 节拆出来的（只看跟本节有关的）。拆的时候写的：(3,) 当成按行配。那节没过的检验：还是没过；那节记过的错：m1「(5,) 是一列」" "$o"; hasnt "这节只讲、只考" "$o"
+L set-plan --json '[{"id":1,"title":"数组"},{"id":5,"title":"axis","requires":[1]},{"id":8,"title":"广播","requires":[5]},{"id":9,"title":"矩阵乘法 @","requires":[8]},{"id":6,"title":"导数","requires":[5,9]},{"id":7,"title":"链式","requires":[6]}]' >/dev/null
+o=$(L status); has "本节是从第 5 节拆出来的" "$o"; has "那节没过的检验：还是没过" "$o"
+# 同一节拆两次：标题记最早的，拆出去的累加；没细化的节拆完不多出步骤
+L split 8 --keep "广播：一维" --json '[{"title":"广播：二维"}]' >/dev/null
+o=$(L split 8 --keep "广播：标量" --json '[{"title":"广播：报错"}]'); has "新加 第 11 节「广播：报错」" "$o"
+o=$(J np '[s.lessons.find(l=>l.id===8).split.from,s.lessons.find(l=>l.id===8).split.into.join("+"),s.lessons.find(l=>l.id===8).steps.length].join("|")'); [ "$o" = '"广播|10+11|0"' ] && ok || bad "拆两次的记录不对" "$o"
+o=$(L help); has "split <节> --keep" "$o"
+
+# T32b 复习重开时换教法次数清零；新节号避开删掉的节留下的错题；先修节拆完不超过 2 节
+fresh T32b
+L init c --title C >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L set-plan --json '[{"id":1,"title":"a"},{"id":2,"title":"b"}]' >/dev/null
+L start 1 --method worked-example --criteria c --steps '["示范","费曼检验"]' >/dev/null; L step 1 1 --result r >/dev/null
+L switch 1 coach "换" --steps '["练","费曼检验"]' >/dev/null; L step 1 2 --result r >/dev/null; L step 1 3 --result r >/dev/null; L done 1 --pass --note ok >/dev/null
+L review --lesson 1 --reason "忘了" >/dev/null
+L start 1 --method diagnose --steps '["探","费曼检验"]' >/dev/null
+o=$(L status); hasnt "本节已经换过" "$o"
+o=$(L switch 1 coach "复习换"); has "一节最多换一次教法" "$o"; hasnt "已经换过 2 次" "$o"
+L mistake 2 "旧误解" "对" >/dev/null
+L set-plan --json '[{"id":1,"title":"a"}]' >/dev/null
+o=$(L split 1 --keep a1 --criteria c --json '[{"title":"a2"}]' --steps '["费曼检验"]'); has "新加 第 3 节「a2」" "$o"
+fresh T32c
+L init j --title J >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null
+L prereq set --json '[{"name":"Java","role":"core","reason":"写控制器"}]' >/dev/null; L prereq answer Java C >/dev/null; L prereq decide Java learn-first >/dev/null
+L set-plan --json '[{"id":1,"kind":"prereq","prereqSkill":"Java","title":"Java 语法"},{"id":2,"title":"接口","uses":["Java"]}]' >/dev/null
+o=$(L split 1 --keep "变量" --json '[{"title":"类"},{"title":"集合"}]'); has "先修「Java」最多 2 节先修节（拆完会有 3 节）" "$o"
+o=$(L split 1 --keep "变量" --json '[{"title":"类"}]'); has "新加 第 3 节「类」" "$o"
+o=$(J j 's.lessons.map(l=>l.id+":"+l.kind+":"+l.requires.join("+")).join(",")'); [ "$o" = '"1:prereq:,3:prereq:1,2:main:1+3"' ] && ok || bad "先修节拆开后不对" "$o"
+P2=$(J j 's.lessons.map(l=>({id:l.id,title:l.title,kind:l.kind,prereqSkill:l.prereqSkill||undefined,requires:l.requires,uses:l.uses}))')
+o=$(L set-plan --json "$P2"); has "计划已保存" "$o"
+
 ROOT=$(cd "$(dirname "$P")/.." && pwd)
 o=$(node -e '
 const fs=require("fs"),r=process.argv[1]

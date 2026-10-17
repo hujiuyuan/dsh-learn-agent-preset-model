@@ -1956,6 +1956,9 @@ commands['set-plan'] = ({ flags }) => {
       uses: n.uses || [],
       forced: o.forced || false,
       ...(o.directCheck ? { directCheck: true } : {}),
+      ...(o.split ? { split: o.split } : {}),
+      ...(o.splitOf ? { splitOf: o.splitOf, splitNotes: o.splitNotes ?? null } : {}),
+      ...(Number.isInteger(o.switches) ? { switches: o.switches } : {}),
     }
   })
   // 进行中的节多了没学完的前置（新插的先修节或过渡节）：先暂停它，做过的步骤保留
@@ -2010,6 +2013,7 @@ commands.start = ({ pos, flags }) => {
   if (!l.passCriteria) fail('这一节还没有达标标准，用 --criteria 指定')
   if (!l.steps.length) fail('这一节还没拆步骤，用 --steps \'["...","..."]\' 指定（每步 10-15 分钟）')
   if (l.methodHistory[l.methodHistory.length - 1] !== l.method) l.methodHistory.push(l.method)
+  if (l.status === 'review') l.switches = 0
   l.status = 'in_progress'
   saveState(name, s, `开始第 ${l.id} 节「${l.title}」，教法：${METHOD_NAMES[l.method]}`)
   extra.push(criteriaLine(l))
@@ -2035,6 +2039,14 @@ function parseSteps(raw) {
   return steps
 }
 const newSteps = (titles) => titles.map((t, i) => ({ title: t, status: i === 0 ? 'in_progress' : 'todo', result: null }))
+const isCheckStep = (st) => /检验|考核/.test(st.title)
+// 这一节换过几次教法；达标标准是不是几项拼起来的（「、」「；」隔开）
+// switches 只数 learn switch 真换了的次数，复习重开时清零；老档案没有这个字段，按教法历史估
+const switchCount = (l) => (Number.isInteger(l.switches) ? l.switches : Math.max(0, (l.methodHistory || []).length - 1))
+const methodTrail = (l) => (l.methodHistory || []).slice(-(switchCount(l) + 1)).map((m) => METHOD_NAMES[m] || m).join(' → ')
+const multiPart = (c) => String(c || '').split(/[、；;]/).filter((x) => x.trim()).length >= 2
+const SPLIT_TIP = (id) => `用 learn split ${id} 把卡住的那块拆成单独一节（接在本节后面学），本节只检验已经做对的部分`
+const switchedText = (l) => `这一节已经换过 ${switchCount(l)} 次教法（${methodTrail(l)}）`
 
 // 示范例题的节：进入讲解或练习的一步时提醒先讲后问（检验那一步不提醒）
 const TEACH_FIRST = '（给教练看，不用转告）这一步如果要用到没讲过的东西（新函数、新写法、新规则，或讲过的东西的新情况）：这一轮只讲，先具体例子，再用 bash 跑出来的完整代码和输出，最后讲规律；讲完只问看懂没有，不出题。用户说看懂了，下一轮再出题，题目只考讲过的。'
@@ -2064,7 +2076,8 @@ commands.step = ({ pos, flags }) => {
     if (nx && !l.steps.some((x) => x.status === 'in_progress')) nx.status = 'in_progress'
   }
   saveState(name, s, `第 ${l.id} 节第 ${n} 步「${st.title}」${status === 'done' ? '完成' : '进行到一半'}：${flags.result}`)
-  const tip = status === 'done' ? teachFirstTip(l) : null
+  let tip = status === 'done' ? teachFirstTip(l) : null
+  if (status === 'done' && st === l.steps[l.steps.length - 1] && isCheckStep(st)) tip = `这是检验那一步，记完就判：learn done ${l.id} --pass|--fail --note "…"。没过别在检验里接着讲课、加题，done --fail 时用 --steps 追加补练。`
   return `${tip ? `${tip}\n` : ''}${positionLine(s)}`
 }
 
@@ -2091,14 +2104,13 @@ commands.check = ({ pos, flags }) => {
     if (k) extra.push(`第 ${other.id} 节做到第 ${k}/${other.steps.length} 步还没检验，已暂停；回来用 learn start ${other.id}（不带 --steps）接着做。`)
   }
   const reason = flags.reason ? String(flags.reason).slice(0, 80) : '用户说这节会了，直接检验'
-  const isCheck = (st) => /检验|考核/.test(st.title)
   const last = l.steps[l.steps.length - 1]
   for (const st of l.steps) {
-    if (st.status === 'done' || (st === last && isCheck(st))) continue
+    if (st.status === 'done' || (st === last && isCheckStep(st))) continue
     st.status = 'done'
     st.result = `跳过：${reason}`
   }
-  if (!last || !isCheck(last) || allDone) l.steps.push(...newSteps(['直接检验']))
+  if (!last || !isCheckStep(last) || allDone) l.steps.push(...newSteps(['直接检验']))
   for (const st of l.steps) if (st.status !== 'done') { st.status = 'in_progress'; break }
   l.status = 'in_progress'
   l.forced = unmet.length > 0
@@ -2115,10 +2127,17 @@ commands.switch = ({ pos, flags }) => {
   const m = need(pos[1], '新教法')
   if (!METHODS.includes(m)) fail(`教法非法：${m}。可选：${METHODS.join(', ')}`)
   const reason = need(pos[2] || flags.reason, '换教法的原因')
+  const undone0 = l.steps.filter((x) => x.status !== 'done')
+  // 正在做的是最后那步检验：检验要先判完（记在原来的教法上），不能拿来讲课或换成别的练习。
+  // 说「这节我会了」进的直接检验不算：用户改主意要学，直接换教法重拆
+  const atCheck = l.status === 'in_progress' && !l.directCheck && undone0.length === 1 && undone0[0] === l.steps[l.steps.length - 1] && isCheckStep(undone0[0])
+  if (atCheck && l.method !== m && !flags.force) fail(`第 ${l.id} 节正在检验（「${undone0[0].title}」），先把这次检验判完：没过就 learn done ${l.id} --fail --note "…" --steps '["<按${METHOD_NAMES[m]}补练没过的那一块>","费曼检验"]'，再 learn switch ${l.id} ${m} "<原因>"。不要把检验这一步拿来讲课或做别的练习；确认不判就换加 --force yes`)
   const from = l.method
+  const before = switchCount(l)
   l.method = m
   l.methodReason = reason
   if (l.methodHistory[l.methodHistory.length - 1] !== m) l.methodHistory.push(m)
+  l.switches = from && from !== m ? before + 1 : before
   if (flags.steps) {
     const steps = parseSteps(flags.steps)
     const kept = l.steps.filter((x) => x.status === 'done')
@@ -2131,8 +2150,75 @@ commands.switch = ({ pos, flags }) => {
   if (l.status !== 'in_progress') tip.push(`开讲这节时 learn start ${l.id}，再加载 skill teach-${m}。`)
   else if (!left.length) tip.push(`步骤都做完了：先 learn done ${l.id} --pass|--fail --note "…" 判定；要按新教法补练就加 --steps '[…]'。`)
   else tip.push(`加载 skill teach-${m}，按它的做法接着教。`)
-  if (!flags.steps && left.length && from !== m) tip.push(`剩下的 ${left.length} 步是按${METHOD_NAMES[from] || '原来的教法'}拆的（${left.map((x) => `「${x.title}」`).join('')}），和新教法对不上就重拆：learn switch ${l.id} ${m} "<原因>" --steps '[…]'（做完的步骤会保留）。`)
+  if (!flags.steps && left.length && from !== m && !atCheck) tip.push(`剩下的 ${left.length} 步是按${METHOD_NAMES[from] || '原来的教法'}拆的（${left.map((x) => `「${x.title}」`).join('')}），和新教法对不上就重拆：learn switch ${l.id} ${m} "<原因>" --steps '[…]'（做完的步骤会保留）。`)
+  // 换来换去，用户每次都得重新适应做法：一节最多换一次，再卡就拆小
+  if (from && from !== m && switchCount(l) === 1) tip.push(`\n一节最多换一次教法：这一节之后用这一种讲完；再卡住就${SPLIT_TIP(l.id)}。`)
+  if (switchCount(l) >= 2) tip.push(`\n${switchedText(l)}。做法一直变，用户每次都要重新适应，最累人。从现在起用这一种讲完，不要再换；再卡住多半是一节里东西太多，${SPLIT_TIP(l.id)}。`)
   return `已换成${METHOD_NAMES[m]}。${tip.join('')}\n${positionLine(s)}`
+}
+
+// 一节东西太多、只卡在其中一块：把那块拆成新的节，接在本节后面依次学；本节改成只考留下的部分
+commands.split = ({ pos, flags }) => {
+  const name = pickCourse(flags)
+  const s = loadState(name)
+  const l = lesson(s, intArg(pos[0], '节号'))
+  if (isDone(l)) fail(`第 ${l.id} 节已经${STATUS_NAMES[l.status]}，不用拆`)
+  const keep = String(need(flags.keep, '--keep "<本节留下的部分，作为本节的新标题>"')).trim()
+  if (!keep) fail('--keep 不能是空的：写本节留下的部分，作为本节的新标题')
+  const criteria = flags.criteria && flags.criteria !== true ? String(flags.criteria).trim() : ''
+  if (l.passCriteria && !criteria) fail(`第 ${l.id} 节原来的达标标准还包括要拆出去的部分（${l.passCriteria}）：加 --criteria "<只考「${keep}」的达标标准>"`)
+  const list = readJsonArg(flags)
+  if (!Array.isArray(list) || !list.length || list.some((x) => !x || typeof x.title !== 'string' || !x.title.trim())) {
+    fail('--json 是拆出去的新节，非空数组，每项要有 title，如 \'[{"title":"广播","summary":"两个形状不同的数组怎么配；卡在哪"}]\'')
+  }
+  // 没做完的讲解、练习里可能有拆出去的内容：要 --steps 重给，不替教练删掉
+  const teachLeft = l.steps.filter((x) => x.status !== 'done' && !isCheckStep(x))
+  if (teachLeft.length && !flags.steps) fail(`第 ${l.id} 节还有没做完的讲解或练习步骤（${teachLeft.map((x) => `「${x.title}」`).join('')}）：加 --steps '[…]' 给出只讲、只考「${keep}」的剩余步骤，最后一步是检验（做完的步骤会保留）。「${keep}」已经学完、只差检验，就写 --steps '["检验：只考「${keep}」"]'`)
+  if (l.kind === 'prereq') {
+    const n = s.lessons.filter((x) => x.kind === 'prereq' && x.prereqSkill === l.prereqSkill).length + list.length
+    if (n > 2) fail(`先修「${l.prereqSkill}」最多 2 节先修节（拆完会有 ${n} 节），只讲本课要用的部分：先修节不再拆，卡住的那块在本节里讲完`)
+  }
+  // 新节号避开删掉的节留下的错题和疑问，免得接上别人的记录
+  const used = [...s.lessons.map((x) => x.id), ...s.mistakes.map((x) => x.lesson), ...s.questions.map((x) => x.lesson)].filter(Number.isInteger)
+  const maxId = Math.max(0, ...used)
+  const added = list.map((x, i) => ({
+    id: maxId + 1 + i,
+    title: x.title.trim(),
+    summary: typeof x.summary === 'string' && x.summary.trim() ? x.summary.trim() : null,
+    requires: [i === 0 ? l.id : maxId + i],
+    method: null, methodReason: null, passCriteria: null, check: null,
+    status: 'todo', attempts: 0, methodHistory: [], steps: [], doneAt: null, notes: [],
+    kind: l.kind === 'prereq' ? 'prereq' : 'main',
+    prereqSkill: l.kind === 'prereq' ? l.prereqSkill : null,
+    uses: [...(l.uses || [])],
+    forced: false,
+    splitOf: l.id,
+    splitNotes: l.notes.length,
+  }))
+  const lastId = added[added.length - 1].id
+  // 原来跟在本节后面的节，改成等拆出去的最后一节学完
+  const waiting = []
+  for (const x of s.lessons) {
+    if (x.id !== l.id && (x.requires || []).includes(l.id)) { x.requires = [...x.requires, lastId]; waiting.push(x.id) }
+  }
+  s.lessons.splice(s.lessons.indexOf(l) + 1, 0, ...added)
+  checkPlan(s.lessons)
+  const from = l.title
+  l.title = keep
+  if (criteria) l.passCriteria = criteria
+  // 拆过几次：标题记最早那个，拆出去的节累加；notes 记拆的时候已有几次检验（之后的才算新标准下的）
+  l.split = { from: l.split?.from || from, into: [...(l.split?.into || []), ...added.map((x) => x.id)], notes: l.notes.length }
+  // 做完的步骤保留；剩下的换成 --steps，没给（只剩检验或还没细化）就只留一步检验
+  if (flags.steps || l.steps.length) {
+    const rest = flags.steps ? parseSteps(flags.steps) : [`检验：只考「${keep}」`]
+    l.steps = [...l.steps.filter((x) => x.status === 'done'), ...newSteps(rest)]
+    if (flags.steps) delete l.directCheck
+  }
+  saveState(name, s, `第 ${l.id} 节拆开：「${from}」只留「${keep}」，拆出 ${added.map((x) => `第 ${x.id} 节「${x.title}」`).join('、')}`)
+  const out = [`已拆开：第 ${l.id} 节只留「${keep}」${criteria ? `，达标标准改成：${l.passCriteria}` : ''}。新加 ${added.map((x) => `第 ${x.id} 节「${x.title}」`).join(' → ')}，按这个顺序接在后面学；学到时按 learn-plan 细化，每节一种教法、一套例子讲完。`]
+  if (waiting.length) out.push(`原来跟在第 ${l.id} 节后面的第 ${waiting.join('、')} 节，改成等第 ${lastId} 节学完。`)
+  if (l.status === 'in_progress') out.push(`第 ${l.id} 节接着做剩下的步骤，只讲、只考「${keep}」，拆出去的内容这节不再讲。检验过了 learn done ${l.id} --pass --note "…"，然后 learn start ${added[0].id}。`)
+  return `${out.join('\n')}\n${positionLine(s)}`
 }
 
 commands.done = ({ pos, flags }) => {
@@ -2167,8 +2253,14 @@ commands.done = ({ pos, flags }) => {
       l.steps.push(...newSteps(titles))
       added = `已追加 ${titles.length} 步：${titles.join(' → ')}。`
     } else if (remedy) fail(`第 ${l.id} 节还有没做完的步骤，先做完再检验；要改剩下的步骤用 learn switch ${l.id} ${l.method} "<原因>" --steps '[…]'`)
-    const stuck = l.notes.slice(-2).every((x) => !x.pass) && l.notes.length >= 2
-    msg = stuck ? `${added}这一节已连续 2 次未达标：按规则换教法（learn switch，带 --steps 会替换没做的步骤）。仍不行：缺本课前面某节 → 退回前置节（learn review --lesson <节>）；缺本课以外的技能 → learn prereq gap "<技能>" --reason "…"。` : `未达标。${added}针对没过的那一项继续练。`
+    // 拆过的节只看拆完以后的检验（拆之前考的是原来那套达标标准）
+    const recent = l.notes.slice(l.split?.notes || 0)
+    const stuck = recent.length >= 2 && recent.slice(-2).every((x) => !x.pass)
+    // 达标标准有几项、只卡在其中一块：拆出去，比整节重讲、换教法都轻
+    const part = multiPart(l.passCriteria) ? `如果达标标准里其余几项都做对了、只卡在一块：${SPLIT_TIP(l.id)}，不要整节重讲。` : ''
+    const tired = switchCount(l) >= 1 ? `${switchedText(l)}，不要再换。` : ''
+    if (stuck) msg = `${added}这一节已连续 2 次未达标。${part}${tired || '整节都没掌握：换教法（learn switch，带 --steps 会替换没做的步骤）。'}仍不行：缺本课前面某节 → 退回前置节（learn review --lesson <节>）；缺本课以外的技能 → learn prereq gap "<技能>" --reason "…"。`
+    else msg = `未达标。${added}针对没过的那一项继续练。${part}${tired}`
   }
   saveState(name, s, `第 ${l.id} 节检验${flags.pass ? '通过' : '未通过'}：${note}`)
   let receipt = ''
@@ -2367,6 +2459,11 @@ commands.status = ({ flags }) => {
   const orphan = orphanPrereqLessons(s)
   if (orphan.length) out.push(`⚠ ${orphanText(orphan)}`)
   if (cur?.passCriteria) out.push(criteriaLine(cur))
+  const into = cur?.split && !isDone(cur) ? cur.split.into.map((id) => s.lessons.find((x) => x.id === id)).filter(Boolean) : []
+  if (into.length) {
+    out.push(`本节是从「${cur.split.from}」拆出来的：${into.map((x) => `「${x.title}」移到第 ${x.id} 节`).join('，')}。这节只讲、只考「${cur.title}」，下面的检验备注和错题里关于拆出去部分的，留到那几节再处理。`)
+  }
+  if (cur && cur.status === 'in_progress' && switchCount(cur) >= 1) out.push(`本节已经换过 ${switchCount(cur)} 次教法（${methodTrail(cur)}）：一节最多换一次，不要再换，用现在这种讲完${cur.split ? '' : '；再卡住就 learn split 把卡住的那块拆出去'}。`)
   const brief = (x) => (x.length > 40 ? `${x.slice(0, 40)}…` : x)
   if (cur && cur.status === 'todo' && !cur.method && s.baseline.length) out.push(`摸底（细化这节、选教法时看）：${s.baseline.map((b) => `${b.ability}=${b.level}${b.level === 'none' ? `（${brief(b.evidence)}）` : ''}`).join('，')}`)
   // 检验备注：本节检验过就给本节最近一次，否则给最近检验过的那一节（细化新一节时参考）
@@ -2379,6 +2476,13 @@ commands.status = ({ flags }) => {
   }
   const curMistakes = cur ? s.mistakes.filter((m) => m.lesson === cur.id && !m.graduated) : []
   if (curMistakes.length) out.push(`本节记过的错：${curMistakes.slice(0, 3).map((m) => `${m.id}「${m.wrong}」`).join('；')}${curMistakes.length > 3 ? ` 等 ${curMistakes.length} 条` : ''}`)
+  // 拆出来的节：带上原来那节没过的检验和错题（卡在哪，细化这节时要看）
+  const parent = cur?.splitOf ? s.lessons.find((x) => x.id === cur.splitOf) : null
+  if (parent && !isDone(cur)) {
+    const fails = (parent.notes || []).slice(0, cur.splitNotes ?? undefined).filter((x) => !x.pass)
+    const pm = s.mistakes.filter((m) => m.lesson === parent.id && !m.graduated)
+    out.push(`本节是从第 ${parent.id} 节拆出来的（只看跟本节有关的）。${cur.summary ? `拆的时候写的：${cur.summary}。` : ''}那节没过的检验：${fails.length ? clip(fails[fails.length - 1].note) : '无'}${pm.length ? `；那节记过的错：${pm.slice(0, 3).map((m) => `${m.id}「${m.wrong}」`).join('；')}` : ''}`)
+  }
 
   // 上次学习：取最近一次有内容的会话
   const sessions = s.sessions.filter((x) => x.lastActive)
@@ -2944,6 +3048,8 @@ commands.help = () => `learn —— 学习进度脚本（数据目录：${HOME}�
        step <节> <步> --result "<结果>"         这一步做完了（默认）；只做了一半加 --partial
        check <节> [--reason "…"]                用户说这节会了、想跳过：讲解和练习记成跳过，直接到检验
        switch <节> <教法> "<原因>" [--steps '[…]']
+       split <节> --keep "<本节留下的部分>" --criteria "<只考留下部分的达标标准>" --json '[{"title":"…","summary":"…"}]' [--steps '[…]']
+                                                一节太大、只卡在一块：拆成新的节接在后面学
        done <节> --pass|--fail --note "<检验证据>" [--steps '["补…","费曼检验"]']   没过时追加补练步骤（不给就追加默认两步）
 疑问   ask "<原话>" [--lesson <节>] | answer <qid> "<结论>"
 错题   mistake <节> "<错误理解>" "<正确理解>" [--from <带来误解的已会技能>] | due | review <mid> --pass|--fail
