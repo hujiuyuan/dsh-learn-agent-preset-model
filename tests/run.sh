@@ -938,6 +938,51 @@ o=$(J j 's.lessons.map(l=>l.id+":"+l.kind+":"+l.requires.join("+")).join(",")');
 P2=$(J j 's.lessons.map(l=>({id:l.id,title:l.title,kind:l.kind,prereqSkill:l.prereqSkill||undefined,requires:l.requires,uses:l.uses}))')
 o=$(L set-plan --json "$P2"); has "计划已保存" "$o"
 
+# T32d 拆节后错题挪给拆出去的节：那节检验过一次前不复习；挪错题不算一次学习
+fresh T32d
+L init c --title C >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L set-plan --json '[{"id":1,"title":"axis、广播"},{"id":2,"title":"导数","requires":[1]}]' >/dev/null
+L start 1 --method worked-example --criteria "axis；广播" --steps '["示范","费曼检验"]' >/dev/null; L step 1 1 --result r >/dev/null
+L mistake 1 "(5,) 是一列" "一维不分行列" >/dev/null; L mistake 1 "axis=0 是横着加" "axis=0 沿行方向往下" >/dev/null
+o=$(L split 1 --keep axis --criteria "说清 axis" --json '[{"title":"广播"},{"title":"@"}]'); has "第 1 节还记着 2 条错题：m1「(5,) 是一列」；m2「axis=0 是横着加」。属于拆出去那块的，用 learn mistake <mid> --to <新节号> 挪过去" "$o"
+o=$(L status); has "留到那几节再处理（错题用 learn mistake <mid> --to <节号> 挪过去）" "$o"
+o=$(L mistake m9 --to 3); has "没有错题 m9" "$o"
+o=$(L mistake m1); has "挪错题要给目标节：learn mistake m1 --to <节号>" "$o"
+o=$(L mistake m1 --to 99); has "没有第 99 节" "$o"
+o=$(L mistake m1 --to 1); has "m1 已经在第 1 节" "$o"
+L pause --summary s --next n >/dev/null; N=$(J c 's.sessions.length')
+o=$(L mistake m1 --to 3); has "已把 m1 从第 1 节挪到第 3 节「广播」。第 3 节检验过一次以后再复习它，在那之前 learn due 不列它。" "$o"
+o=$(J c 's.sessions.length+"|"+s.sessions[s.sessions.length-1].closed'); [ "$o" = "\"$N|true\"" ] && ok || bad "挪错题不该开一次新的学习" "$o"
+o=$(L status); has "本节记过的错：m2「axis=0 是横着加」" "$o"; hasnt "m1「" "$o"; has "上次说好的下次起点：n" "$o"
+node -e "const f=process.env.LEARN_HOME+'/c/state.json';const s=require(f);for(const m of s.mistakes)m.due='$TODAY';require('fs').writeFileSync(f,JSON.stringify(s))"
+o=$(L due); has "今天到期 1 条" "$o"; has "m2（第 1 节" "$o"; hasnt "m1（" "$o"
+o=$(L status); has "今天到期复习：1 条（m2：" "$o"
+o=$(L review m1 --pass); has "m1 挪到了第 3 节「广播」，那节还没检验过：检验过一次以后 learn due 会列出它" "$o"
+L step 1 2 --result r >/dev/null; L done 1 --pass --note ok >/dev/null
+L start 3 --method coach --criteria c --steps '["练","费曼检验"]' >/dev/null
+o=$(L due); hasnt "m1（" "$o"
+L step 3 1 --result r >/dev/null; L step 3 2 --result r >/dev/null; L done 3 --fail --note "还没懂" >/dev/null
+o=$(L due); has "m1（第 3 节" "$o"
+o=$(L review m1 --pass); has "m1 通过" "$o"
+node -e "const f=process.env.LEARN_HOME+'/c/state.json';const s=require(f);s.mistakes[1].graduated=true;require('fs').writeFileSync(f,JSON.stringify(s))"
+o=$(L mistake m2 --to 3); has "m2 已移出错题本，不用挪" "$o"
+o=$(L help); has "mistake <mid> --to <节>" "$o"
+# 没挪过的错题照常到期（直接检验到一半被暂停的节也一样）；拆完以后新记的错题不提示挪
+fresh T32e
+L init e --title E >/dev/null; L set-goal --json '{"exam":"e"}' >/dev/null; L prereq set --none n >/dev/null
+L set-plan --json '[{"id":1,"title":"a"},{"id":2,"title":"b"}]' >/dev/null
+L check 2 --reason "说学过" >/dev/null; L mistake 2 "直接检验暴露的误解" "正解" >/dev/null
+L start 1 --method coach --criteria c --steps '["练","费曼检验"]' >/dev/null
+node -e "const f=process.env.LEARN_HOME+'/e/state.json';const s=require(f);s.mistakes[0].due='$TODAY';require('fs').writeFileSync(f,JSON.stringify(s))"
+o=$(L due); has "m1（第 2 节" "$o"
+o=$(L review m1 --pass); has "m1 通过" "$o"
+L split 1 --keep a1 --criteria c --json '[{"title":"a2"}]' --steps '["费曼检验"]' >/dev/null
+L mistake 1 "拆完后记的" "对" >/dev/null
+o=$(L status); has "这节只讲、只考「a1」" "$o"; hasnt "错题用 learn mistake" "$o"
+L done 2 --fail --note "没过" >/dev/null
+o=$(L mistake m2 --to 2); has "已把 m2 从第 1 节挪到第 2 节「b」。" "$o"; hasnt "检验过一次以后" "$o"
+o=$(J e 's.mistakes[1].wait===undefined'); [ "$o" = true ] && ok || bad "挪到检验过的节不该等" "$o"
+
 ROOT=$(cd "$(dirname "$P")/.." && pwd)
 o=$(node -e '
 const fs=require("fs"),r=process.argv[1]
